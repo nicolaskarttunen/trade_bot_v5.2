@@ -62,7 +62,7 @@ news_items = []
 # TELEGRAM CONTROL
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-telegram_trading_enabled = True
+telegram_trading_enabled = False
 telegram_signals = []
 telegram_offset = None
 telegram_lock = threading.Lock()
