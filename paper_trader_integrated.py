@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import websocket
+import requests
 from dotenv import load_dotenv
 
 from alpaca.trading.client import TradingClient
@@ -22,11 +23,9 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from features import enrich, FEATURES
 
 
-# ============================================================
-# V5.2 INTEGRATED PAPER TRADER
+# =====================================================# V5.2 INTEGRATED PAPER TRADER
 # Realtime news + ML + 5min bars + Alpaca Paper orders
-# ============================================================
-
+# =====================================================
 BASE = Path(__file__).resolve().parent
 load_dotenv(".env.v5")
 
@@ -44,7 +43,7 @@ if not API_KEY or not SECRET_KEY:
 if str(os.getenv("ALPACA_PAPER", "")).lower() != "true":
     raise SystemExit(
         "TURVAVIRHE: ALPACA_PAPER ei ole true. "
-        "Tämä ohjelma sallii vain Paper Tradingin."
+        "TÃƒÆ’Ã‚Â¤mÃƒÆ’Ã‚Â¤ ohjelma sallii vain Paper Tradingin."
     )
 
 trading = TradingClient(API_KEY, SECRET_KEY, paper=True)
@@ -59,6 +58,14 @@ STATE_FILE = BASE / "paper_live_state.json"
 
 news_lock = threading.Lock()
 news_items = []
+
+# TELEGRAM CONTROL
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+telegram_trading_enabled = True
+telegram_signals = []
+telegram_offset = None
+telegram_lock = threading.Lock()
 
 
 # ------------------------------------------------------------
@@ -389,6 +396,142 @@ def get_ml_probability(symbol):
 
 
 # ------------------------------------------------------------
+# TELEGRAM
+# ------------------------------------------------------------
+
+def telegram_send(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        r=requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id":TELEGRAM_CHAT_ID,"text":message},
+            timeout=10
+        )
+        return bool(r.ok and r.json().get("ok"))
+    except Exception as exc:
+        print("TELEGRAM SEND ERROR:", repr(exc))
+        return False
+
+
+def telegram_loop():
+    global telegram_offset
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("TELEGRAM | asetukset puuttuvat")
+        return
+
+    telegram_send("ÃƒÂ°Ã…Â¸Ã…Â¸Ã‚Â¢ V5.2 Telegram-yhteys kÃƒÆ’Ã‚Â¤ynnissÃƒÆ’Ã‚Â¤.")
+
+    while True:
+        try:
+            params={"timeout":25,"limit":50}
+            if telegram_offset is not None:
+                params["offset"]=telegram_offset
+
+            r=requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                params=params,
+                timeout=35
+            )
+
+            if not r.ok:
+                print("TELEGRAM POLL HTTP:", r.status_code)
+                time.sleep(5)
+                continue
+
+            data=r.json()
+
+            if not data.get("ok"):
+                print("TELEGRAM POLL ERROR:", data)
+                time.sleep(5)
+                continue
+
+            for update in data.get("result", []):
+                telegram_offset=update["update_id"]+1
+
+                message=update.get("message")
+                if not message:
+                    continue
+
+                chat_id=str((message.get("chat") or {}).get("id",""))
+                if chat_id != str(TELEGRAM_CHAT_ID):
+                    continue
+
+                text=str(message.get("text","")).strip()
+                if not text:
+                    continue
+
+                command=text.split()[0].lower().split("@")[0]
+
+                if command == "/start":
+                    telegram_trading_enabled=True
+                    telegram_send("ÃƒÂ°Ã…Â¸Ã…Â¸Ã‚Â¢ UUSIEN TREIDIEN TEKO ON PÃƒÆ’Ã¢â‚¬Å¾ÃƒÆ’Ã¢â‚¬Å¾LLÃƒÆ’Ã¢â‚¬Å¾.")
+
+                elif command == "/stop":
+                    telegram_trading_enabled=False
+                    telegram_send("ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â´ UUSIEN TREIDIEN TEKO POIS PÃƒÆ’Ã¢â‚¬Å¾ÃƒÆ’Ã¢â‚¬Å¾LTÃƒÆ’Ã¢â‚¬Å¾. Avoimia positioita ei suljeta.")
+
+                elif command == "/status":
+                    telegram_send(
+                        f"ÃƒÂ°Ã…Â¸Ã‚Â¤Ã¢â‚¬â€œ V5.2 PAPER BOT\n"
+                        f"Uudet treidit: {'ÃƒÂ°Ã…Â¸Ã…Â¸Ã‚Â¢ ON' if telegram_trading_enabled else 'ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â´ OFF'}\n"
+                        f"Avoimet positiot: {len(get_positions())}"
+                    )
+
+                elif command == "/positions":
+                    positions=get_positions()
+                    if not positions:
+                        telegram_send("ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‚Â¦ Ei avoimia positioita.")
+                    else:
+                        lines=["ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‚Â¦ AVOIMET POSITIOT",""]
+                        for symbol,p in positions.items():
+                            lines.append(
+                                f"{symbol} | qty {getattr(p,'qty','?')} | "
+                                f"entry {getattr(p,'avg_entry_price','?')} | "
+                                f"P/L {getattr(p,'unrealized_pl','?')}"
+                            )
+                        telegram_send("\n".join(lines))
+
+                elif command == "/signals":
+                    try:
+                        limit = int(args[0]) if args else 10
+                    except ValueError:
+                        limit = 10
+
+                    limit = max(1, min(50, limit))
+
+                    with telegram_lock:
+                        items = list(telegram_signals[-limit:])
+
+                    if not items:
+                        telegram_send("ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  Ei signaaleja vielÃƒÆ’Ã‚Â¤.")
+                    else:
+                        lines = [f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  VIIMEISET {len(items)} SIGNAALIA", ""]
+                        for item in reversed(items):
+                            lines.append(
+                                f"{item['time']} | {item['symbol']} | "
+                                f"ML {item['ml']:.3f} | "
+                                f"SCORE {item['score']:.1f} | "
+                                f"NEWS {item['news']:+.2f} | "
+                                f"{item['decision']}"
+                            )
+                        telegram_send("\n".join(lines))
+
+                elif command == "/help":
+                    telegram_send(
+                        "ÃƒÂ°Ã…Â¸Ã‚Â¤Ã¢â‚¬â€œ V5.2 KOMENNOT\n\n"
+                        "/start ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ salli uudet treidit\n"
+                        "/stop ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ estÃƒÆ’Ã‚Â¤ uudet treidit\n"
+                        "/status ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ botin tila\n"
+                        "/positions ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ avoimet positiot\n"
+                        "/help ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ komennot"
+                    )
+
+        except Exception as exc:
+            print("TELEGRAM LOOP ERROR:", repr(exc))
+            time.sleep(10)
+
+# ------------------------------------------------------------
 # RISK / STATE
 # ------------------------------------------------------------
 
@@ -558,7 +701,7 @@ def submit_paper_long(symbol, reference_price, probability, score, news_score):
 
     if quantity < 1:
         print(
-            f"{symbol} | ei kauppaa | laskettu määrä < 1"
+            f"{symbol} | ei kauppaa | laskettu mÃƒÆ’Ã‚Â¤ÃƒÆ’Ã‚Â¤rÃƒÆ’Ã‚Â¤ < 1"
         )
         return
 
@@ -712,6 +855,29 @@ def market_loop():
                     f"SCORE={trade_score:.1f}"
                 )
 
+
+                signal_decision = (
+                    "BUY"
+                    if (
+                        telegram_trading_enabled
+                        and probability >= float(CFG["probability_threshold"])
+                        and trade_score >= float(CFG["trade_score_threshold"])
+                    )
+                    else "NO TRADE"
+                )
+
+                with telegram_lock:
+                    telegram_signals.append({
+                        "time": datetime.now().strftime("%H:%M:%S"),
+                        "symbol": symbol,
+                        "ml": float(probability),
+                        "score": float(trade_score),
+                        "news": float(recent_news),
+                        "decision": signal_decision,
+                    })
+
+                    if len(telegram_signals) > 100:
+                        del telegram_signals[:-100]
                 if (
                     probability
                     >= float(CFG["probability_threshold"])
@@ -731,7 +897,7 @@ def market_loop():
 
         except KeyboardInterrupt:
             print()
-            print("V5.2 paper-botti pysäytetty.")
+            print("V5.2 paper-botti pysÃƒÆ’Ã‚Â¤ytetty.")
             break
 
         except Exception as exc:
@@ -750,5 +916,8 @@ if __name__ == "__main__":
         daemon=True
     )
     news_thread.start()
+
+    telegram_thread = threading.Thread(target=telegram_loop, daemon=True)
+    telegram_thread.start()
 
     market_loop()
