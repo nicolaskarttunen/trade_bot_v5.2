@@ -340,7 +340,11 @@ def get_bars(symbol, limit=250):
 
 
 def get_benchmark():
-    return get_bars(BENCHMARK, 250)
+    benchmark = get_bars(BENCHMARK, 250)
+    if benchmark.empty:
+        return benchmark
+    benchmark = enrich(benchmark)
+    return benchmark[['timestamp', 'close', 'atr_pct']].copy()
 
 
 def get_ml_probability(symbol):
