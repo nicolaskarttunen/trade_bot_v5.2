@@ -415,12 +415,12 @@ def telegram_send(message):
 
 
 def telegram_loop():
-    global telegram_offset
+    global telegram_offset, telegram_trading_enabled
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("TELEGRAM | asetukset puuttuvat")
         return
 
-    telegram_send("ÃƒÂ°Ã…Â¸Ã…Â¸Ã‚Â¢ V5.2 Telegram-yhteys kÃƒÆ’Ã‚Â¤ynnissÃƒÆ’Ã‚Â¤.")
+    telegram_send("\U0001f7e2 V5.2 Telegram-yhteys k\u00e4ynniss\u00e4.")
 
     while True:
         try:
@@ -458,6 +458,7 @@ def telegram_loop():
                     continue
 
                 text=str(message.get("text","")).strip()
+                args=text.split()[1:]
                 if not text:
                     continue
 
@@ -465,25 +466,25 @@ def telegram_loop():
 
                 if command == "/start":
                     telegram_trading_enabled=True
-                    telegram_send("ÃƒÂ°Ã…Â¸Ã…Â¸Ã‚Â¢ UUSIEN TREIDIEN TEKO ON PÃƒÆ’Ã¢â‚¬Å¾ÃƒÆ’Ã¢â‚¬Å¾LLÃƒÆ’Ã¢â‚¬Å¾.")
+                    telegram_send("\U0001f7e2 UUSIEN TREIDIEN TEKO ON P\u00c4\u00c4LL\u00c4.")
 
                 elif command == "/stop":
                     telegram_trading_enabled=False
-                    telegram_send("ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â´ UUSIEN TREIDIEN TEKO POIS PÃƒÆ’Ã¢â‚¬Å¾ÃƒÆ’Ã¢â‚¬Å¾LTÃƒÆ’Ã¢â‚¬Å¾. Avoimia positioita ei suljeta.")
+                    telegram_send("\U0001f534 UUSIEN TREIDIEN TEKO POIS P\u00c4\u00c4LT\u00c4. Avoimia positioita ei suljeta.")
 
                 elif command == "/status":
                     telegram_send(
-                        f"ÃƒÂ°Ã…Â¸Ã‚Â¤Ã¢â‚¬â€œ V5.2 PAPER BOT\n"
-                        f"Uudet treidit: {'ÃƒÂ°Ã…Â¸Ã…Â¸Ã‚Â¢ ON' if telegram_trading_enabled else 'ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â´ OFF'}\n"
+                        f"\U0001f916 V5.2 PAPER BOT\n"
+                        f"Uudet treidit: {chr(0x1f7e2) if telegram_trading_enabled else chr(0x1f534)} {'ON' if telegram_trading_enabled else 'OFF'}\n"
                         f"Avoimet positiot: {len(get_positions())}"
                     )
 
                 elif command == "/positions":
                     positions=get_positions()
                     if not positions:
-                        telegram_send("ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‚Â¦ Ei avoimia positioita.")
+                        telegram_send("\U0001f4ca Ei avoimia positioita.")
                     else:
-                        lines=["ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‚Â¦ AVOIMET POSITIOT",""]
+                        lines=["\U0001f4ca AVOIMET POSITIOT",""]
                         for symbol,p in positions.items():
                             lines.append(
                                 f"{symbol} | qty {getattr(p,'qty','?')} | "
@@ -519,12 +520,12 @@ def telegram_loop():
 
                 elif command == "/help":
                     telegram_send(
-                        "ÃƒÂ°Ã…Â¸Ã‚Â¤Ã¢â‚¬â€œ V5.2 KOMENNOT\n\n"
-                        "/start ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ salli uudet treidit\n"
-                        "/stop ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ estÃƒÆ’Ã‚Â¤ uudet treidit\n"
-                        "/status ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ botin tila\n"
-                        "/positions ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ avoimet positiot\n"
-                        "/help ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ komennot"
+                        "\U0001f916 V5.2 KOMENNOT\n\n"
+                        "/start - salli uudet treidit\n"
+                        "/stop - est\u00e4 uudet treidit\n"
+                        "/status - botin tila\n"
+                        "/positions - avoimet positiot\n"
+                        "/help - komennot"
                     )
 
         except Exception as exc:
@@ -656,6 +657,9 @@ def calculate_trade_score(probability, row, news_score):
 
 
 def submit_paper_long(symbol, reference_price, probability, score, news_score):
+    if not telegram_trading_enabled:
+        return
+
     state = get_daily_state()
 
     if state["trades"] >= int(CFG["max_trades_per_day"]):
@@ -879,7 +883,8 @@ def market_loop():
                     if len(telegram_signals) > 100:
                         del telegram_signals[:-100]
                 if (
-                    probability
+                    telegram_trading_enabled
+                    and probability
                     >= float(CFG["probability_threshold"])
                     and trade_score
                     >= float(CFG["trade_score_threshold"])
