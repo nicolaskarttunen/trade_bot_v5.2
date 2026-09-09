@@ -1,0 +1,40 @@
+{
+  "symbols": [
+    "NVDA",
+    "TSLA",
+    "AMD",
+    "AAPL",
+    "MSFT",
+    "META",
+    "AMZN"
+  ],
+  "benchmark_symbols": [
+    "SPY",
+    "QQQ"
+  ],
+  "timeframe_minutes": 5,
+  "feed": "iex",
+  "history_start": "2023-01-01",
+  "history_end": "2026-09-01",
+  "train_fraction": 0.7,
+  "label_horizon_bars": 3,
+  "label_threshold_pct": 0.002,
+  "news_decay_minutes": 120,
+  "news_lookback_minutes": 360,
+  "slippage_bps": 3,
+  "spread_bps": 2,
+  "commission_per_trade": 0,
+  "initial_cash": 100000,
+  "risk_per_trade_pct": 0.005,
+  "max_position_pct": 0.1,
+  "max_daily_loss_pct": 0.015,
+  "probability_threshold": 0.55,
+  "trade_score_threshold": 55,
+  "max_trades_per_day": 3,
+  "stop_atr_multiplier": 1.5,
+  "reward_risk_ratio": 2.0,
+  "news_weight": 0.3,
+  "ml_weight": 0.5,
+  "market_weight": 0.2,
+  "risk_multiplier": 1.0
+}

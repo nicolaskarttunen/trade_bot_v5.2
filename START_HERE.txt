@@ -1,0 +1,1 @@
+V5.2: ML + REAL ALPACA NEWS\n\nRun: download_data.py -> download_news.py -> train_models.py -> backtest.py\nResearch only; no order execution.\n
