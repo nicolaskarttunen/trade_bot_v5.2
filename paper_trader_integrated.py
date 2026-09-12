@@ -55,6 +55,7 @@ BENCHMARK = CFG["benchmark_symbols"][0]
 NEWS_FILE = BASE / "news_live_history.json"
 TRADE_FILE = BASE / "trades.csv"
 STATE_FILE = BASE / "paper_live_state.json"
+ORDER_NOTIFICATION_FILE = BASE / "paper_order_notifications.json"
 
 news_lock = threading.Lock()
 news_items = []
@@ -504,17 +505,33 @@ def telegram_loop():
                         items = list(telegram_signals[-limit:])
 
                     if not items:
-                        telegram_send("ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  Ei signaaleja vielÃƒÆ’Ã‚Â¤.")
+                        telegram_send("\U0001F4CA Ei signaaleja viel\u00e4.")
                     else:
-                        lines = [f"ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  VIIMEISET {len(items)} SIGNAALIA", ""]
+                        lines = [
+                            f"\U0001F4CA VIIMEISET {len(items)} SIGNAALIA",
+                            ""
+                        ]
+
                         for item in reversed(items):
-                            lines.append(
-                                f"{item['time']} | {item['symbol']} | "
-                                f"ML {item['ml']:.3f} | "
-                                f"SCORE {item['score']:.1f} | "
-                                f"NEWS {item['news']:+.2f} | "
-                                f"{item['decision']}"
-                            )
+                            decision = item["decision"]
+
+                            if decision == "BUY":
+                                icon = "\U0001F7E2"
+                                decision_text = "BUY"
+                            else:
+                                icon = "\U0001F7E1"
+                                decision_text = "NO TRADE"
+
+                            lines.extend([
+                                f"{icon} {item['symbol']}",
+                                f"\U0001F552 {item['time']}",
+                                f"ML: {item['ml'] * 100:.1f}%",
+                                f"Score: {item['score']:.1f}/100",
+                                f"News: {item['news']:+.2f}",
+                                f"\u27A1\uFE0F {decision_text}",
+                                ""
+                            ])
+
                         telegram_send("\n".join(lines))
 
                 elif command == "/help":
@@ -554,6 +571,27 @@ def load_state():
 def save_state(state):
     STATE_FILE.write_text(
         json.dumps(state, indent=2),
+        encoding="utf-8"
+    )
+
+
+def load_notified_order_ids():
+    if ORDER_NOTIFICATION_FILE.exists():
+        try:
+            data = json.loads(
+                ORDER_NOTIFICATION_FILE.read_text(encoding="utf-8")
+            )
+            if isinstance(data, list):
+                return set(str(order_id) for order_id in data)
+        except Exception:
+            pass
+
+    return set()
+
+
+def save_notified_order_ids(order_ids):
+    ORDER_NOTIFICATION_FILE.write_text(
+        json.dumps(sorted(order_ids), indent=2),
         encoding="utf-8"
     )
 
@@ -778,6 +816,207 @@ def flatten_end_of_day():
         print("EOD flatten error:", repr(exc))
 
 
+
+# ------------------------------------------------------------
+# TRADE EXECUTION NOTIFICATIONS
+# ------------------------------------------------------------
+
+notified_order_ids = load_notified_order_ids()
+order_monitor_started_at = datetime.now(timezone.utc)
+
+
+def _order_value(order):
+    try:
+        qty = float(order.filled_qty or order.qty or 0)
+        price = float(order.filled_avg_price or 0)
+        return qty * price
+    except Exception:
+        return 0.0
+
+
+def _bracket_prices(order):
+    stop_price = None
+    target_price = None
+
+    try:
+        for leg in (order.legs or []):
+            if getattr(leg, "stop_price", None) is not None:
+                stop_price = float(leg.stop_price)
+
+            if getattr(leg, "limit_price", None) is not None:
+                target_price = float(leg.limit_price)
+    except Exception:
+        pass
+
+    return stop_price, target_price
+
+
+def _send_buy_fill_notification(order):
+    symbol = str(order.symbol)
+    qty = float(order.filled_qty or order.qty or 0)
+    price = float(order.filled_avg_price or 0)
+    value = qty * price
+
+    stop_price, target_price = _bracket_prices(order)
+
+    lines = [
+        "\U0001F7E2 OSTO TOTEUTETTU",
+        "",
+        symbol,
+        f"M\u00e4\u00e4r\u00e4: {qty:g} kpl",
+        f"Hinta: ${price:.2f}",
+        f"Arvo: ${value:,.2f}",
+    ]
+
+    if stop_price is not None:
+        lines.append(f"\U0001F6D1 Stop: ${stop_price:.2f}")
+
+    if target_price is not None:
+        lines.append(f"\U0001F3AF Target: ${target_price:.2f}")
+
+    try:
+        entry_file = BASE / "paper_order_entries.json"
+        entries = {}
+
+        if entry_file.exists():
+            entries = json.loads(
+                entry_file.read_text(encoding="utf-8")
+            )
+
+        entries[symbol] = price
+
+        entry_file.write_text(
+            json.dumps(entries, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        print("ORDER ENTRY SAVE ERROR:", repr(exc))
+
+    return telegram_send("\n".join(lines))
+
+
+def _send_sell_fill_notification(order, entry_price=None):
+    symbol = str(order.symbol)
+    qty = float(order.filled_qty or order.qty or 0)
+    price = float(order.filled_avg_price or 0)
+
+    reason = "MYYNTI"
+    icon = "\U0001F534"
+
+    try:
+        order_type = str(order.order_type).lower()
+
+        if "limit" in order_type:
+            reason = "TAKE PROFIT"
+            icon = "\U0001F3AF"
+        elif "stop" in order_type:
+            reason = "STOP LOSS"
+            icon = "\U0001F6D1"
+    except Exception:
+        pass
+
+    lines = [
+        f"{icon} MYYNTI TOTEUTETTU",
+        "",
+        symbol,
+        f"M\u00e4\u00e4r\u00e4: {qty:g} kpl",
+        f"Exit: ${price:.2f}",
+        "",
+        f"{icon} {reason}",
+    ]
+
+    if entry_price is not None:
+        pnl = (price - entry_price) * qty
+        sign = "+" if pnl >= 0 else "-"
+        lines.append(f"P/L: {sign}${abs(pnl):,.2f}")
+
+    return telegram_send("\n".join(lines))
+
+
+def check_filled_orders():
+    try:
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+
+        orders = trading.get_orders(
+            filter=GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                limit=100,
+                nested=True,
+            )
+        )
+
+        for order in orders:
+            order_id = str(order.id)
+
+            if order_id in notified_order_ids:
+                continue
+
+            status = str(order.status).lower()
+
+            if "filled" not in status:
+                continue
+            filled_at = getattr(order, "filled_at", None)
+
+            if filled_at is not None and filled_at < order_monitor_started_at:
+                continue
+
+            side = str(order.side).lower()
+
+            if "buy" in side:
+                sent = _send_buy_fill_notification(order)
+
+            elif "sell" in side:
+                entry_price = None
+
+                try:
+                    entry_file = BASE / "paper_order_entries.json"
+
+                    if entry_file.exists():
+                        entries = json.loads(
+                            entry_file.read_text(encoding="utf-8")
+                        )
+                        entry_price = entries.get(str(order.symbol))
+                        if entry_price is not None:
+                            entry_price = float(entry_price)
+                except Exception:
+                    entry_price = None
+
+                sent = _send_sell_fill_notification(
+                    order,
+                    entry_price=entry_price,
+                )
+
+            else:
+                continue
+
+            if not sent:
+                continue
+
+            # Poistetaan SELL-entry vasta onnistuneen Telegram-ilmoituksen jälkeen.
+            if "sell" in side:
+                try:
+                    entry_file = BASE / "paper_order_entries.json"
+
+                    if entry_file.exists():
+                        entries = json.loads(
+                            entry_file.read_text(encoding="utf-8")
+                        )
+                        entries.pop(str(order.symbol), None)
+                        entry_file.write_text(
+                            json.dumps(entries, indent=2),
+                            encoding="utf-8",
+                        )
+                except Exception:
+                    pass
+
+            notified_order_ids.add(order_id)
+            save_notified_order_ids(notified_order_ids)
+
+    except Exception as exc:
+        print("ORDER NOTIFICATION ERROR:", repr(exc))
+
+
 # ------------------------------------------------------------
 # MAIN MARKET LOOP
 # ------------------------------------------------------------
@@ -812,6 +1051,8 @@ def market_loop():
                 flatten_end_of_day()
                 time.sleep(300)
                 continue
+
+            check_filled_orders()
 
             state = get_daily_state()
 
