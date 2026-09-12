@@ -416,7 +416,7 @@ def telegram_send(message):
 
 
 def telegram_loop():
-    global telegram_offset
+    global telegram_offset, telegram_trading_enabled
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("TELEGRAM | asetukset puuttuvat")
         return
