@@ -43,7 +43,7 @@ if not API_KEY or not SECRET_KEY:
 if str(os.getenv("ALPACA_PAPER", "")).lower() != "true":
     raise SystemExit(
         "TURVAVIRHE: ALPACA_PAPER ei ole true. "
-        "TÃƒÆ’Ã‚Â¤mÃƒÆ’Ã‚Â¤ ohjelma sallii vain Paper Tradingin."
+        "Tämä ohjelma sallii vain Paper Tradingin."
     )
 
 trading = TradingClient(API_KEY, SECRET_KEY, paper=True)
@@ -421,7 +421,7 @@ def telegram_loop():
         print("TELEGRAM | asetukset puuttuvat")
         return
 
-    telegram_send("ÃƒÂ°Ã…Â¸Ã…Â¸Ã‚Â¢ V5.2 Telegram-yhteys kÃƒÆ’Ã‚Â¤ynnissÃƒÆ’Ã‚Â¤.")
+    telegram_send("🟢 V5.3 Telegram-yhteys käynnissä.")
 
     while True:
         try:
@@ -462,29 +462,31 @@ def telegram_loop():
                 if not text:
                     continue
 
-                command=text.split()[0].lower().split("@")[0]
+                parts = text.split()
+                command=parts[0].lower().split("@")[0]
+                args=parts[1:]
 
                 if command == "/start":
                     telegram_trading_enabled=True
-                    telegram_send("ÃƒÂ°Ã…Â¸Ã…Â¸Ã‚Â¢ UUSIEN TREIDIEN TEKO ON PÃƒÆ’Ã¢â‚¬Å¾ÃƒÆ’Ã¢â‚¬Å¾LLÃƒÆ’Ã¢â‚¬Å¾.")
+                    telegram_send("🟢 UUSIEN TREIDIEN TEKO ON PÄÄLLÄ.")
 
                 elif command == "/stop":
                     telegram_trading_enabled=False
-                    telegram_send("ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â´ UUSIEN TREIDIEN TEKO POIS PÃƒÆ’Ã¢â‚¬Å¾ÃƒÆ’Ã¢â‚¬Å¾LTÃƒÆ’Ã¢â‚¬Å¾. Avoimia positioita ei suljeta.")
+                    telegram_send("🔴 UUSIEN TREIDIEN TEKO POIS PÄÄLTÄ. Avoimia positioita ei suljeta.")
 
                 elif command == "/status":
                     telegram_send(
-                        f"ÃƒÂ°Ã…Â¸Ã‚Â¤Ã¢â‚¬â€œ V5.2 PAPER BOT\n"
-                        f"Uudet treidit: {'ÃƒÂ°Ã…Â¸Ã…Â¸Ã‚Â¢ ON' if telegram_trading_enabled else 'ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â´ OFF'}\n"
+                        f"🤖 V5.3 PAPER BOT\n"
+                        f"Uudet treidit: {'🟢 ON' if telegram_trading_enabled else '🔴 OFF'}\n"
                         f"Avoimet positiot: {len(get_positions())}"
                     )
 
                 elif command == "/positions":
                     positions=get_positions()
                     if not positions:
-                        telegram_send("ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‚Â¦ Ei avoimia positioita.")
+                        telegram_send("📋 Ei avoimia positioita.")
                     else:
-                        lines=["ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‚Â¦ AVOIMET POSITIOT",""]
+                        lines=["📋 AVOIMET POSITIOT",""]
                         for symbol,p in positions.items():
                             lines.append(
                                 f"{symbol} | qty {getattr(p,'qty','?')} | "
@@ -536,12 +538,12 @@ def telegram_loop():
 
                 elif command == "/help":
                     telegram_send(
-                        "ÃƒÂ°Ã…Â¸Ã‚Â¤Ã¢â‚¬â€œ V5.2 KOMENNOT\n\n"
-                        "/start ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ salli uudet treidit\n"
-                        "/stop ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ estÃƒÆ’Ã‚Â¤ uudet treidit\n"
-                        "/status ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ botin tila\n"
-                        "/positions ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ avoimet positiot\n"
-                        "/help ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ komennot"
+                        "🤖 V5.3 KOMENNOT\n\n"
+                        "/start – salli uudet treidit\n"
+                        "/stop – estä uudet treidit\n"
+                        "/status – botin tila\n"
+                        "/positions – avoimet positiot\n"
+                        "/help – komennot"
                     )
 
         except Exception as exc:
@@ -739,7 +741,7 @@ def submit_paper_long(symbol, reference_price, probability, score, news_score):
 
     if quantity < 1:
         print(
-            f"{symbol} | ei kauppaa | laskettu mÃƒÆ’Ã‚Â¤ÃƒÆ’Ã‚Â¤rÃƒÆ’Ã‚Â¤ < 1"
+            f"{symbol} | ei kauppaa | laskettu määrä < 1"
         )
         return
 
@@ -1138,7 +1140,7 @@ def market_loop():
 
         except KeyboardInterrupt:
             print()
-            print("V5.2 paper-botti pysÃƒÆ’Ã‚Â¤ytetty.")
+            print("V5.3 paper-botti pysäytetty.")
             break
 
         except Exception as exc:
