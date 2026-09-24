@@ -6,3 +6,17 @@ __pycache__/
 !.env.example
 trades.csv
 news_live_history.json
+
+# Runtime state / logs
+paper_live_state.json
+paper_order_entries.json
+paper_order_notifications.json
+paper_trader.log
+
+# Local backups
+config_before_*.json
+paper_trader_integrated_BEFORE_*.py
+paper_trader_integrated_before_*.py
+
+# Accidental local files
+udo systemctl edit v52-paper-bot.service
