@@ -17,7 +17,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from features import enrich, FEATURES
@@ -306,6 +306,29 @@ def news_stream_loop():
 # ------------------------------------------------------------
 # MARKET DATA / ML
 # ------------------------------------------------------------
+
+def get_latest_trade_price(symbol):
+    """Return Alpaca's latest trade price for order pricing."""
+    try:
+        request = StockLatestTradeRequest(
+            symbol_or_symbols=symbol,
+            feed=CFG["feed"],
+        )
+
+        trades = data_client.get_stock_latest_trade(request)
+        trade = trades[symbol]
+
+        price = float(trade.price)
+
+        if price <= 0:
+            raise ValueError(f"invalid latest trade price: {price}")
+
+        return price
+
+    except Exception as exc:
+        print(f"LATEST PRICE ERROR | {symbol} | {exc!r}")
+        return None
+
 
 def get_bars(symbol, limit=250):
     end = datetime.now(timezone.utc)
@@ -641,6 +664,34 @@ def get_positions():
         return {}
 
 
+def has_open_buy_order(symbol):
+    """Return True if an active BUY order already exists for this symbol."""
+    try:
+        orders = trading.get_orders()
+        active_statuses = {
+            "new",
+            "accepted",
+            "pending_new",
+            "partially_filled",
+            "pending_replace",
+            "accepted_for_bidding",
+        }
+
+        for order in orders:
+            if (
+                order.symbol == symbol
+                and str(order.side).lower().endswith("buy")
+                and str(order.status).lower() in active_statuses
+            ):
+                return True
+
+        return False
+    except Exception as e:
+        print(f"ORDER CHECK ERROR | {symbol} | {e}")
+        # Fail closed: if we cannot verify orders, do not send a new BUY.
+        return True
+
+
 def write_trade(
     timestamp,
     symbol,
@@ -695,7 +746,7 @@ def calculate_trade_score(probability, row, news_score):
     return score
 
 
-def submit_paper_long(symbol, reference_price, probability, score, news_score):
+def submit_paper_long(symbol, reference_price, probability, score, news_score, row):
     state = get_daily_state()
 
     if state["trades"] >= int(CFG["max_trades_per_day"]):
@@ -713,14 +764,36 @@ def submit_paper_long(symbol, reference_price, probability, score, news_score):
     if symbol in get_positions():
         return
 
+    # Use a fresh market price for actual order pricing.
+    # The 5-minute row is still used for ML features and ATR.
+    signal_price = reference_price
+    latest_price = get_latest_trade_price(symbol)
+
+    if latest_price is None:
+        print(
+            f"ORDER BLOCKED | {symbol} | "
+            f"latest trade price unavailable"
+        )
+        return
+
+    reference_price = latest_price
+
+    print(
+        f"PRICE SYNC | {symbol} | "
+        f"signal={signal_price:.4f} | "
+        f"latest={reference_price:.4f} | "
+        f"diff_pct={(reference_price / signal_price - 1.0) * 100:+.2f}%"
+    )
+
     # Risk budget.
     risk_dollars = equity * float(CFG["risk_per_trade_pct"])
 
-    # Conservative stop distance.
-    # The actual native stop is placed with the order.
+    # ATR-based stop distance.
+    # ATR comes from the signal bar, but SL/TP are anchored
+    # to the fresh market price.
     stop_distance = max(
-        reference_price * 0.001,
-        reference_price * 0.005
+        float(row["atr"]) * float(CFG["stop_atr_multiplier"]),
+        reference_price * 0.003
     )
 
     quantity_by_risk = int(
@@ -770,6 +843,15 @@ def submit_paper_long(symbol, reference_price, probability, score, news_score):
         ),
     )
 
+    # Prevent duplicate BUY orders when the position has not appeared yet.
+    if symbol in get_positions() or has_open_buy_order(symbol):
+        print(
+            f"ORDER BLOCKED | {symbol} | "
+            f"existing position or active BUY order"
+        )
+        return
+
+    print(f"ORDER DEBUG | {symbol} | ref={reference_price:.4f} | ATR={float(row['atr']):.4f} | stop_dist={stop_distance:.4f} | SL={stop_price:.2f} | TP={target_price:.2f}")
     order = trading.submit_order(order_request)
 
     state["trades"] += 1
@@ -1133,6 +1215,7 @@ def market_loop():
                         probability,
                         trade_score,
                         recent_news,
+                        row,
                     )
 
             # Avoid repeatedly processing the same completed bar.
