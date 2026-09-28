@@ -14,8 +14,8 @@ import requests
 from dotenv import load_dotenv
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, TakeProfitRequest, StopLossRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, OrderType
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -634,8 +634,33 @@ def get_daily_state():
             "date": today,
             "start_equity": equity,
             "trades": 0,
+            "opening_scan_done": False,
         }
 
+        save_state(state)
+
+        # New trading day: remove stale OPG tracking entries.
+        # Alpaca itself handles expiration/cancellation of old OPG
+        # orders; this only cleans our local tracking state.
+        opening_file = BASE / "opening_orders.json"
+
+        if opening_file.exists():
+            try:
+                opening_file.write_text(
+                    json.dumps({}, indent=2),
+                    encoding="utf-8",
+                )
+                print(
+                    "OPG STATE CLEANUP | "
+                    "new trading day"
+                )
+            except Exception as exc:
+                print(
+                    f"OPG STATE CLEANUP ERROR | {exc!r}"
+                )
+
+    if "opening_scan_done" not in state:
+        state["opening_scan_done"] = False
         save_state(state)
 
     return state
@@ -746,7 +771,73 @@ def calculate_trade_score(probability, row, news_score):
     return score
 
 
-def submit_paper_long(symbol, reference_price, probability, score, news_score, row):
+
+OPG_LIMIT_BUFFER_PCT = 0.005
+
+
+def submit_opening_order(
+    symbol,
+    reference_price,
+    quantity,
+    stop_price,
+    target_price,
+    probability,
+    score,
+    news_score,
+):
+    """Queue a PAPER opening candidate. No order is sent before 09:30 ET."""
+
+    if symbol in get_positions() or has_open_buy_order(symbol):
+        print(
+            f"OPENING QUEUE BLOCKED | {symbol} | "
+            f"existing position or active BUY order"
+        )
+        return None
+
+    opening_file = BASE / "opening_orders.json"
+    opening_orders = {}
+
+    if opening_file.exists():
+        try:
+            opening_orders = json.loads(
+                opening_file.read_text(encoding="utf-8")
+            )
+        except Exception:
+            opening_orders = {}
+
+    opening_orders[symbol] = {
+        "order_id": None,
+        "quantity": int(quantity),
+        "stop_price": float(stop_price),
+        "target_price": float(target_price),
+        "probability": float(probability),
+        "score": float(score),
+        "news_score": float(news_score),
+        "reference_price": float(reference_price),
+        "status": "queued",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    opening_file.write_text(
+        json.dumps(opening_orders, indent=2),
+        encoding="utf-8",
+    )
+
+    print(
+        f"OPENING QUEUED | {symbol} x{quantity} | "
+        f"reference={reference_price:.2f} | "
+        f"waiting for 09:30 ET"
+    )
+
+    # submit_paper_long() expects an object with .id for logging.
+    class QueuedOrder:
+        id = f"QUEUED-{symbol}"
+
+    return QueuedOrder()
+
+
+
+def submit_paper_long(symbol, reference_price, probability, score, news_score, row, opening=False):
     state = get_daily_state()
 
     if state["trades"] >= int(CFG["max_trades_per_day"]):
@@ -828,6 +919,49 @@ def submit_paper_long(symbol, reference_price, probability, score, news_score, r
         + stop_distance * float(CFG["reward_risk_ratio"]),
         2
     )
+
+    if opening:
+        order = submit_opening_order(
+            symbol=symbol,
+            reference_price=reference_price,
+            quantity=quantity,
+            stop_price=stop_price,
+            target_price=target_price,
+            probability=probability,
+            score=score,
+            news_score=news_score,
+        )
+
+        if order is None:
+            return
+
+        # Do not count an OPG submission as a trade yet.
+        # It is counted only after the opening-auction BUY actually fills.
+
+        reason = (
+            f"OPG; "
+            f"ML={probability:.3f}; "
+            f"SCORE={score:.1f}; "
+            f"NEWS={news_score:+.3f}; "
+            f"SL={stop_price}; "
+            f"TP={target_price}"
+        )
+
+        write_trade(
+            datetime.now(timezone.utc).isoformat(),
+            symbol,
+            "BUY",
+            quantity,
+            reference_price,
+            str(order.id),
+            0,
+            probability,
+            score,
+            news_score,
+            reason,
+        )
+
+        return
 
     order_request = MarketOrderRequest(
         symbol=symbol,
@@ -1017,6 +1151,194 @@ def _send_sell_fill_notification(order, entry_price=None):
     return telegram_send("\n".join(lines))
 
 
+
+def submit_queued_opening_orders():
+    """Submit queued PAPER opening candidates as DAY market BUYs."""
+
+    opening_file = BASE / "opening_orders.json"
+
+    if not opening_file.exists():
+        return
+
+    try:
+        opening_orders = json.loads(
+            opening_file.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        print(f"OPENING QUEUE READ ERROR | {exc!r}")
+        return
+
+    state = get_daily_state()
+
+    reached, equity, start_equity = daily_loss_reached(state)
+
+    if reached:
+        print(
+            f"OPENING MARKET BLOCKED | daily loss limit | "
+            f"equity={equity:.2f} | start={start_equity:.2f}"
+        )
+        return
+
+    changed = False
+
+    for symbol, data in list(opening_orders.items()):
+
+        if data.get("status") != "queued":
+            continue
+
+        if symbol in get_positions() or has_open_buy_order(symbol):
+            print(
+                f"OPENING MARKET BLOCKED | {symbol} | "
+                f"existing position or active BUY order"
+            )
+            continue
+
+        planned_quantity = int(data.get("quantity", 0))
+
+        if planned_quantity < 1:
+            print(
+                f"OPENING MARKET ERROR | {symbol} | "
+                f"invalid quantity={planned_quantity}"
+            )
+            continue
+
+        # Recheck the current price at the actual market open.
+        latest_price = get_latest_trade_price(symbol)
+
+        if latest_price is None or latest_price <= 0:
+            print(
+                f"OPENING MARKET BLOCKED | {symbol} | "
+                f"latest price unavailable"
+            )
+            continue
+
+        # Enforce the 10% position cap again using the actual
+        # opening-time price. Never increase the quantity selected
+        # during the premarket scan.
+        max_position_value = (
+            equity * float(CFG["max_position_pct"])
+        )
+
+        quantity_by_cap = int(
+            max_position_value / latest_price
+        )
+
+        quantity = min(
+            planned_quantity,
+            quantity_by_cap,
+        )
+
+        if quantity < 1:
+            print(
+                f"OPENING MARKET BLOCKED | {symbol} | "
+                f"quantity < 1 after opening price cap"
+            )
+            continue
+
+        print(
+            f"OPENING PRICE SYNC | {symbol} | "
+            f"premarket={float(data['reference_price']):.4f} | "
+            f"open_latest={latest_price:.4f} | "
+            f"planned_qty={planned_quantity} | "
+            f"final_qty={quantity}"
+        )
+
+        order_request = MarketOrderRequest(
+            symbol=symbol,
+            qty=quantity,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+        )
+
+        try:
+            order = trading.submit_order(order_request)
+        except Exception as exc:
+            print(
+                f"OPENING MARKET ERROR | {symbol} | {exc!r}"
+            )
+            continue
+
+        data["order_id"] = str(order.id)
+        data["quantity"] = int(quantity)
+        data["status"] = "submitted"
+        data["market_reference_price"] = float(latest_price)
+        data["submitted_at"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        opening_orders[symbol] = data
+        changed = True
+
+        print(
+            f"OPENING MARKET BUY | PAPER {symbol} x{quantity} | "
+            f"order_id={order.id}"
+        )
+
+    if changed:
+        opening_file.write_text(
+            json.dumps(opening_orders, indent=2),
+            encoding="utf-8",
+        )
+
+
+
+def submit_opening_oco(symbol, quantity, stop_price, target_price):
+    """Attach TP + SL to a position created by an OPG entry."""
+
+    try:
+        # Alpaca OCO orders are exit orders for an already-open position.
+        # Use the actual filled quantity and the previously calculated
+        # protection levels.
+        stop_price = float(stop_price)
+        target_price = float(target_price)
+        quantity = float(quantity)
+
+        if quantity <= 0:
+            raise ValueError(
+                f"invalid OCO quantity: {quantity}"
+            )
+
+        if stop_price >= target_price:
+            raise ValueError(
+                f"invalid OCO prices: SL={stop_price} "
+                f"TP={target_price}"
+            )
+
+        oco_request = LimitOrderRequest(
+            symbol=symbol,
+            qty=quantity,
+            side=OrderSide.SELL,
+            type=OrderType.LIMIT,
+            time_in_force=TimeInForce.GTC,
+            order_class=OrderClass.OCO,
+            take_profit=TakeProfitRequest(
+                limit_price=target_price
+            ),
+            stop_loss=StopLossRequest(
+                stop_price=stop_price
+            ),
+        )
+
+        order = trading.submit_order(oco_request)
+
+        print(
+            f"OPG OCO | {symbol} | "
+            f"qty={quantity:g} | "
+            f"SL={stop_price:.2f} | "
+            f"TP={target_price:.2f} | "
+            f"order_id={order.id}"
+        )
+
+        return order
+
+    except Exception as exc:
+        print(
+            f"OPG OCO ERROR | {symbol} | {exc!r}"
+        )
+        return None
+
+
+
 def check_filled_orders():
     try:
         from alpaca.trading.requests import GetOrdersRequest
@@ -1048,6 +1370,205 @@ def check_filled_orders():
             side = str(order.side).lower()
 
             if "buy" in side:
+                # Check whether this BUY was one of our opening-auction
+                # (OPG) entries. Normal bracket BUYs continue unchanged.
+                opening_file = BASE / "opening_orders.json"
+                opening_orders = {}
+                opening_data = None
+
+                if opening_file.exists():
+                    try:
+                        opening_orders = json.loads(
+                            opening_file.read_text(encoding="utf-8")
+                        )
+
+                        candidate = opening_orders.get(
+                            str(order.symbol)
+                        )
+
+                        if (
+                            candidate
+                            and str(candidate.get("order_id"))
+                            == order_id
+                        ):
+                            opening_data = candidate
+
+                    except Exception as exc:
+                        print(
+                            f"OPG STATE ERROR | "
+                            f"{order.symbol} | {exc!r}"
+                        )
+
+                if opening_data is not None:
+                    filled_qty = float(
+                        getattr(order, "filled_qty", 0) or 0
+                    )
+                    fill_price = float(
+                        getattr(
+                            order,
+                            "filled_avg_price",
+                            0,
+                        ) or 0
+                    )
+
+                    if filled_qty <= 0 or fill_price <= 0:
+                        print(
+                            f"OPG FILL DATA ERROR | "
+                            f"{order.symbol} | "
+                            f"qty={filled_qty} | "
+                            f"price={fill_price}"
+                        )
+                        continue
+
+                    # Preserve the originally calculated risk distance,
+                    # but anchor SL/TP to the actual auction fill price.
+                    planned_reference = float(
+                        opening_data["reference_price"]
+                    )
+                    planned_stop = float(
+                        opening_data["stop_price"]
+                    )
+
+                    stop_distance = (
+                        planned_reference - planned_stop
+                    )
+
+                    if stop_distance <= 0:
+                        print(
+                            f"OPG RISK ERROR | "
+                            f"{order.symbol} | "
+                            f"distance={stop_distance}"
+                        )
+                        continue
+
+                    actual_stop = round(
+                        fill_price - stop_distance,
+                        2,
+                    )
+                    actual_target = round(
+                        fill_price
+                        + stop_distance
+                        * float(CFG["reward_risk_ratio"]),
+                        2,
+                    )
+
+                    print(
+                        f"OPG FILLED | {order.symbol} | "
+                        f"qty={filled_qty:g} | "
+                        f"fill={fill_price:.2f} | "
+                        f"SL={actual_stop:.2f} | "
+                        f"TP={actual_target:.2f}"
+                    )
+
+                    oco_order = submit_opening_oco(
+                        symbol=str(order.symbol),
+                        quantity=filled_qty,
+                        stop_price=actual_stop,
+                        target_price=actual_target,
+                    )
+
+                    if oco_order is None:
+                        # Persist retry count so a process restart cannot
+                        # reset the protection failure counter.
+                        retry_count = int(
+                            opening_data.get(
+                                "protection_retries",
+                                0,
+                            )
+                        ) + 1
+
+                        opening_data[
+                            "protection_retries"
+                        ] = retry_count
+
+                        opening_orders[
+                            str(order.symbol)
+                        ] = opening_data
+
+                        opening_file.write_text(
+                            json.dumps(
+                                opening_orders,
+                                indent=2,
+                            ),
+                            encoding="utf-8",
+                        )
+
+                        print(
+                            f"OPG PROTECTION PENDING | "
+                            f"{order.symbol} | "
+                            f"retry={retry_count}/3"
+                        )
+
+                        if retry_count >= 3:
+                            print(
+                                f"OPG FAIL-SAFE | "
+                                f"{order.symbol} | "
+                                f"OCO protection failed 3 times | "
+                                f"closing position"
+                            )
+
+                            try:
+                                trading.close_position(
+                                    str(order.symbol)
+                                )
+
+                                # The emergency close request was accepted.
+                                # Remove the OPG protection state so we do
+                                # not keep submitting OCO orders as well.
+                                opening_orders.pop(
+                                    str(order.symbol),
+                                    None,
+                                )
+
+                                opening_file.write_text(
+                                    json.dumps(
+                                        opening_orders,
+                                        indent=2,
+                                    ),
+                                    encoding="utf-8",
+                                )
+
+                                print(
+                                    f"OPG FAIL-SAFE CLOSE | "
+                                    f"{order.symbol} | "
+                                    f"close request submitted"
+                                )
+
+                            except Exception as close_exc:
+                                print(
+                                    f"OPG FAIL-SAFE CLOSE ERROR | "
+                                    f"{order.symbol} | "
+                                    f"{close_exc!r}"
+                                )
+
+                        continue
+
+                    # Remove only after OCO protection exists.
+                    opening_orders.pop(
+                        str(order.symbol),
+                        None,
+                    )
+
+                    opening_file.write_text(
+                        json.dumps(
+                            opening_orders,
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+
+                    # Count the trade only after the OPG BUY has
+                    # actually filled and OCO protection is active.
+                    state = get_daily_state()
+                    state["trades"] += 1
+                    save_state(state)
+
+                    print(
+                        f"OPG PROTECTED | "
+                        f"{order.symbol} | OCO active | "
+                        f"daily_trades={state['trades']}"
+                    )
+
                 sent = _send_buy_fill_notification(order)
 
             elif "sell" in side:
@@ -1105,6 +1626,181 @@ def check_filled_orders():
 # MAIN MARKET LOOP
 # ------------------------------------------------------------
 
+
+def run_opening_scan():
+    """Run one daily premarket scan and submit up to the daily OPG limit."""
+
+    state = get_daily_state()
+
+    if state.get("opening_scan_done", False):
+        return
+
+    reached, equity, start_equity = daily_loss_reached(state)
+
+    if reached:
+        print(
+            f"OPENING SCAN BLOCKED | daily loss limit | "
+            f"equity={equity:.2f} | start={start_equity:.2f}"
+        )
+        return
+
+    max_trades = int(CFG["max_trades_per_day"])
+    available_slots = max(
+        0,
+        max_trades - int(state["trades"])
+    )
+
+    if available_slots <= 0:
+        print("OPENING SCAN | no daily trade slots available")
+        state["opening_scan_done"] = True
+        save_state(state)
+        return
+
+    print(
+        f"OPENING SCAN START | "
+        f"symbols={len(SYMBOLS)} | "
+        f"max_opg={available_slots}"
+    )
+
+    submitted = 0
+    current_positions = get_positions()
+
+    for symbol in SYMBOLS:
+        # Never send more OPG entries than the remaining daily slots.
+        if submitted >= available_slots:
+            break
+
+        # Stop sending new OPG orders if we have reached Alpaca's
+        # opening-auction cutoff window.
+        now_et = pd.Timestamp.now(
+            tz="America/New_York"
+        )
+
+        if (
+            now_et.hour > 9
+            or (
+                now_et.hour == 9
+                and now_et.minute >= 28
+            )
+        ):
+            print(
+                "OPENING SCAN STOP | "
+                "09:28 ET OPG cutoff reached"
+            )
+            break
+
+        if symbol in current_positions:
+            continue
+
+        probability, row = get_ml_probability(symbol)
+
+        if probability is None:
+            continue
+
+        recent_news, news_change = get_news_signal(symbol)
+
+        trade_score = calculate_trade_score(
+            probability,
+            row,
+            recent_news,
+        )
+
+        print(
+            f"OPENING | {symbol} | "
+            f"close={float(row.close):.2f} | "
+            f"ML={probability:.3f} | "
+            f"NEWS={recent_news:+.3f} | "
+            f"SCORE={trade_score:.1f}"
+        )
+
+        signal_decision = (
+            "BUY"
+            if (
+                telegram_trading_enabled
+                and probability
+                >= float(CFG["probability_threshold"])
+                and trade_score
+                >= float(CFG["trade_score_threshold"])
+            )
+            else "NO TRADE"
+        )
+
+        with telegram_lock:
+            telegram_signals.append({
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "symbol": symbol,
+                "ml": float(probability),
+                "score": float(trade_score),
+                "news": float(recent_news),
+                "decision": signal_decision,
+            })
+
+            if len(telegram_signals) > 100:
+                del telegram_signals[:-100]
+
+        if not telegram_trading_enabled:
+            continue
+
+        if (
+            probability
+            >= float(CFG["probability_threshold"])
+            and trade_score
+            >= float(CFG["trade_score_threshold"])
+        ):
+            before_file = BASE / "opening_orders.json"
+            before_count = 0
+
+            if before_file.exists():
+                try:
+                    before_count = len(
+                        json.loads(
+                            before_file.read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                    )
+                except Exception:
+                    before_count = 0
+
+            submit_paper_long(
+                symbol,
+                float(row.close),
+                probability,
+                trade_score,
+                recent_news,
+                row,
+                opening=True,
+            )
+
+            after_count = before_count
+
+            if before_file.exists():
+                try:
+                    after_count = len(
+                        json.loads(
+                            before_file.read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                    )
+                except Exception:
+                    after_count = before_count
+
+            if after_count > before_count:
+                submitted += 1
+
+    # Mark complete only after the scan itself finishes.
+    state = get_daily_state()
+    state["opening_scan_done"] = True
+    save_state(state)
+
+    print(
+        f"OPENING SCAN COMPLETE | "
+        f"opening candidates queued={submitted}"
+    )
+
+
+
 def market_loop():
     print()
     print("=" * 65)
@@ -1118,7 +1814,36 @@ def market_loop():
         try:
             clock = trading.get_clock()
 
+            now_et = pd.Timestamp.now(
+                tz="America/New_York"
+            )
+
             if not clock.is_open:
+                # Run one daily opening-auction scan before the
+                # regular session opens. OPG orders must be submitted
+                # before Alpaca's 09:28 ET cutoff.
+                in_opening_window = (
+                    now_et.hour == 9
+                    and 15 <= now_et.minute < 28
+                )
+
+                if in_opening_window:
+                    state = get_daily_state()
+
+                    if not state.get(
+                        "opening_scan_done",
+                        False,
+                    ):
+                        run_opening_scan()
+                    else:
+                        print(
+                            f"{datetime.now():%H:%M:%S} | "
+                            f"Opening scan already complete"
+                        )
+
+                    time.sleep(30)
+                    continue
+
                 print(
                     f"{datetime.now():%H:%M:%S} | Market closed | "
                     f"Next open: {clock.next_open}"
@@ -1126,15 +1851,38 @@ def market_loop():
                 time.sleep(60)
                 continue
 
-            now_et = pd.Timestamp.now(
-                tz="America/New_York"
-            )
-
             # Close positions near the end of the regular session.
             if now_et.hour == 15 and now_et.minute >= 55:
                 flatten_end_of_day()
                 time.sleep(300)
                 continue
+
+            # Immediately after the opening auction, poll OPG fills
+            # rapidly so filled positions receive their OCO protection
+            # as quickly as possible.
+            opening_protection_window = (
+                now_et.hour == 9
+                and 30 <= now_et.minute < 35
+            )
+
+            if opening_protection_window:
+                # PAPER MODE:
+                # Candidates were selected before the open.
+                # Send them as market BUYs once Alpaca reports
+                # the regular session as open.
+                submit_queued_opening_orders()
+                check_filled_orders()
+
+                state = get_daily_state()
+
+                if state.get("opening_scan_done", False):
+                    print(
+                        f"{datetime.now():%H:%M:%S} | "
+                        f"OPENING PROTECTION WINDOW | "
+                        f"checking fills"
+                    )
+                    time.sleep(2)
+                    continue
 
             check_filled_orders()
 
@@ -1150,6 +1898,19 @@ def market_loop():
                     f"start={start_equity:.2f}"
                 )
                 time.sleep(300)
+                continue
+
+            # If today's opening scan was completed, entries for this
+            # session come only from the submitted OPG orders.
+            # Continue monitoring fills/OCO protection and existing
+            # positions, but do not open additional intraday entries.
+            if state.get("opening_scan_done", False):
+                print(
+                    f"{datetime.now():%H:%M:%S} | "
+                    f"OPENING MODE | "
+                    f"no additional intraday entries"
+                )
+                time.sleep(60)
                 continue
 
             current_positions = get_positions()
