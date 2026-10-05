@@ -635,6 +635,7 @@ def get_daily_state():
             "start_equity": equity,
             "trades": 0,
             "opening_scan_done": False,
+            "traded_symbols": [],
         }
 
         save_state(state)
@@ -661,6 +662,10 @@ def get_daily_state():
 
     if "opening_scan_done" not in state:
         state["opening_scan_done"] = False
+        save_state(state)
+
+    if "traded_symbols" not in state:
+        state["traded_symbols"] = []
         save_state(state)
 
     return state
@@ -716,6 +721,190 @@ def has_open_buy_order(symbol):
         # Fail closed: if we cannot verify orders, do not send a new BUY.
         return True
 
+
+
+def _enum_text(value):
+    return str(getattr(value, "value", value)).lower()
+
+
+def _active_buy_orders():
+    """Return active BUY orders. Fail closed by raising on API errors."""
+    active_statuses = {
+        "new",
+        "accepted",
+        "pending_new",
+        "partially_filled",
+        "pending_replace",
+        "accepted_for_bidding",
+    }
+
+    try:
+        orders = trading.get_orders()
+    except Exception as exc:
+        raise RuntimeError(f"active order lookup failed: {exc!r}") from exc
+
+    return [
+        order
+        for order in orders
+        if _enum_text(order.side) == "buy"
+        and _enum_text(order.status) in active_statuses
+    ]
+
+
+def get_portfolio_entry_usage(opening_orders=None):
+    """
+    Return (occupied_symbols, gross_exposure_dollars).
+
+    Exposure includes live positions, remaining quantity on active BUY
+    orders, and opening orders already submitted in the current in-memory
+    opening queue. Any API/pricing failure raises so callers can fail closed.
+    """
+    try:
+        positions = {
+            position.symbol: position
+            for position in trading.get_all_positions()
+        }
+    except Exception as exc:
+        raise RuntimeError(f"position lookup failed: {exc!r}") from exc
+
+    occupied = set(positions)
+    exposure = 0.0
+
+    for symbol, position in positions.items():
+        market_value = float(getattr(position, "market_value", 0) or 0)
+        if market_value == 0:
+            qty = abs(float(getattr(position, "qty", 0) or 0))
+            price = float(
+                getattr(position, "current_price", 0)
+                or getattr(position, "avg_entry_price", 0)
+                or 0
+            )
+            market_value = qty * price
+        exposure += abs(market_value)
+
+    active_buy_symbols = set()
+
+    for order in _active_buy_orders():
+        symbol = str(order.symbol)
+        active_buy_symbols.add(symbol)
+        occupied.add(symbol)
+
+        qty = float(getattr(order, "qty", 0) or 0)
+        filled_qty = float(getattr(order, "filled_qty", 0) or 0)
+        remaining_qty = max(0.0, qty - filled_qty)
+
+        if remaining_qty <= 0:
+            continue
+
+        price = float(getattr(order, "limit_price", 0) or 0)
+        if price <= 0:
+            price = float(getattr(order, "filled_avg_price", 0) or 0)
+        if price <= 0:
+            latest = get_latest_trade_price(symbol)
+            if latest is None or latest <= 0:
+                raise RuntimeError(
+                    f"cannot price active BUY reservation for {symbol}"
+                )
+            price = float(latest)
+
+        exposure += remaining_qty * price
+
+    # Alpaca can take a moment to expose a just-submitted market order.
+    # Count submitted opening orders from our own queue as reservations too,
+    # but avoid double counting symbols already visible through Alpaca.
+    if isinstance(opening_orders, dict):
+        for symbol, data in opening_orders.items():
+            if data.get("status") != "submitted":
+                continue
+            if symbol in positions or symbol in active_buy_symbols:
+                continue
+
+            qty = float(data.get("quantity", 0) or 0)
+            price = float(
+                data.get("market_reference_price", 0)
+                or data.get("reference_price", 0)
+                or 0
+            )
+
+            if qty <= 0 or price <= 0:
+                raise RuntimeError(
+                    f"invalid opening reservation for {symbol}"
+                )
+
+            occupied.add(symbol)
+            exposure += qty * price
+
+    return occupied, exposure
+
+
+def enforce_entry_limits(
+    symbol,
+    reference_price,
+    requested_quantity,
+    equity,
+    opening_orders=None,
+):
+    """
+    Enforce portfolio-wide entry limits immediately before each BUY.
+
+    Hard limits:
+      - max_open_positions unique position/pending-BUY symbols
+      - max_total_exposure_pct gross long exposure including pending BUYs
+
+    Returns the maximum allowed integer quantity. Failures block the entry.
+    """
+    try:
+        requested_quantity = int(requested_quantity)
+        reference_price = float(reference_price)
+        equity = float(equity)
+
+        if requested_quantity < 1 or reference_price <= 0 or equity <= 0:
+            return 0
+
+        occupied, exposure = get_portfolio_entry_usage(
+            opening_orders=opening_orders
+        )
+
+        max_open = int(CFG.get("max_open_positions", 5))
+        max_exposure_pct = float(
+            CFG.get("max_total_exposure_pct", 0.50)
+        )
+
+        if symbol not in occupied and len(occupied) >= max_open:
+            print(
+                f"PORTFOLIO BLOCK | {symbol} | "
+                f"open_or_pending={len(occupied)}/{max_open}"
+            )
+            return 0
+
+        max_exposure = equity * max_exposure_pct
+        remaining_exposure = max(0.0, max_exposure - exposure)
+        qty_by_exposure = int(remaining_exposure / reference_price)
+        allowed_quantity = min(requested_quantity, qty_by_exposure)
+
+        if allowed_quantity < 1:
+            print(
+                f"PORTFOLIO BLOCK | {symbol} | "
+                f"exposure=${exposure:,.2f}/${max_exposure:,.2f} | "
+                f"open_or_pending={len(occupied)}/{max_open}"
+            )
+            return 0
+
+        if allowed_quantity < requested_quantity:
+            print(
+                f"PORTFOLIO CAP | {symbol} | "
+                f"qty={requested_quantity}->{allowed_quantity} | "
+                f"exposure=${exposure:,.2f}/${max_exposure:,.2f}"
+            )
+
+        return allowed_quantity
+
+    except Exception as exc:
+        print(
+            f"PORTFOLIO GUARD ERROR | {symbol} | {exc!r} | "
+            f"entry blocked"
+        )
+        return 0
 
 def write_trade(
     timestamp,
@@ -840,6 +1029,14 @@ def submit_opening_order(
 def submit_paper_long(symbol, reference_price, probability, score, news_score, row, opening=False):
     state = get_daily_state()
 
+    # ONE TRADE PER SYMBOL PER DAY
+    if symbol in state.get("traded_symbols", []):
+        print(
+            f"ORDER BLOCKED | {symbol} | "
+            f"already traded today"
+        )
+        return
+
     if state["trades"] >= int(CFG["max_trades_per_day"]):
         return
 
@@ -884,7 +1081,7 @@ def submit_paper_long(symbol, reference_price, probability, score, news_score, r
     # to the fresh market price.
     stop_distance = max(
         float(row["atr"]) * float(CFG["stop_atr_multiplier"]),
-        reference_price * 0.003
+        reference_price * 0.0125
     )
 
     quantity_by_risk = int(
@@ -901,6 +1098,14 @@ def submit_paper_long(symbol, reference_price, probability, score, news_score, r
     quantity = min(
         quantity_by_risk,
         quantity_by_cap
+    )
+
+    quantity = enforce_entry_limits(
+        symbol=symbol,
+        reference_price=reference_price,
+        requested_quantity=quantity,
+        equity=equity,
+        opening_orders=None,
     )
 
     if quantity < 1:
@@ -989,6 +1194,9 @@ def submit_paper_long(symbol, reference_price, probability, score, news_score, r
     order = trading.submit_order(order_request)
 
     state["trades"] += 1
+    traded_symbols = state.setdefault("traded_symbols", [])
+    if symbol not in traded_symbols:
+        traded_symbols.append(symbol)
     save_state(state)
 
     reason = (
@@ -1040,7 +1248,10 @@ def flatten_end_of_day():
 # ------------------------------------------------------------
 
 notified_order_ids = load_notified_order_ids()
-order_monitor_started_at = datetime.now(timezone.utc)
+
+# Allows recovery after bot/server restarts.
+# Persisted notified_order_ids still prevents duplicates.
+ORDER_NOTIFICATION_LOOKBACK_HOURS = 48
 
 
 def _order_value(order):
@@ -1228,6 +1439,14 @@ def submit_queued_opening_orders():
             quantity_by_cap,
         )
 
+        quantity = enforce_entry_limits(
+            symbol=symbol,
+            reference_price=latest_price,
+            requested_quantity=quantity,
+            equity=equity,
+            opening_orders=opening_orders,
+        )
+
         if quantity < 1:
             print(
                 f"OPENING MARKET BLOCKED | {symbol} | "
@@ -1344,13 +1563,33 @@ def check_filled_orders():
         from alpaca.trading.requests import GetOrdersRequest
         from alpaca.trading.enums import QueryOrderStatus
 
-        orders = trading.get_orders(
+        root_orders = trading.get_orders(
             filter=GetOrdersRequest(
                 status=QueryOrderStatus.CLOSED,
                 limit=100,
                 nested=True,
             )
         )
+
+        # Alpaca nested=True rolls bracket/OCO child orders
+        # (TP / SL) into parent.legs. Flatten one level so
+        # SELL fills are processed as normal orders too.
+        orders = []
+        seen_order_ids = set()
+
+        for parent in root_orders:
+            family = [parent] + list(
+                getattr(parent, "legs", None) or []
+            )
+
+            for item in family:
+                item_id = str(item.id)
+
+                if item_id in seen_order_ids:
+                    continue
+
+                seen_order_ids.add(item_id)
+                orders.append(item)
 
         for order in orders:
             order_id = str(order.id)
@@ -1364,8 +1603,23 @@ def check_filled_orders():
                 continue
             filled_at = getattr(order, "filled_at", None)
 
-            if filled_at is not None and filled_at < order_monitor_started_at:
-                continue
+            if filled_at is not None:
+                filled_ts = pd.Timestamp(filled_at)
+
+                if filled_ts.tzinfo is None:
+                    filled_ts = filled_ts.tz_localize("UTC")
+                else:
+                    filled_ts = filled_ts.tz_convert("UTC")
+
+                notification_cutoff = (
+                    pd.Timestamp.now(tz="UTC")
+                    - pd.Timedelta(
+                        hours=ORDER_NOTIFICATION_LOOKBACK_HOURS
+                    )
+                )
+
+                if filled_ts < notification_cutoff:
+                    continue
 
             side = str(order.side).lower()
 
@@ -1561,6 +1815,9 @@ def check_filled_orders():
                     # actually filled and OCO protection is active.
                     state = get_daily_state()
                     state["trades"] += 1
+                    traded_symbols = state.setdefault("traded_symbols", [])
+                    if symbol not in traded_symbols:
+                        traded_symbols.append(symbol)
                     save_state(state)
 
                     print(
@@ -1900,17 +2157,41 @@ def market_loop():
                 time.sleep(300)
                 continue
 
-            # If today's opening scan was completed, entries for this
-            # session come only from the submitted OPG orders.
-            # Continue monitoring fills/OCO protection and existing
-            # positions, but do not open additional intraday entries.
-            if state.get("opening_scan_done", False):
+            # After the opening-auction phase, allow fresh intraday
+            # entries between 09:35 and 15:30 ET.
+            intraday_entry_window = (
+                (
+                    now_et.hour > 9
+                    or (
+                        now_et.hour == 9
+                        and now_et.minute >= 35
+                    )
+                )
+                and (
+                    now_et.hour < 15
+                    or (
+                        now_et.hour == 15
+                        and now_et.minute < 30
+                    )
+                )
+            )
+
+            if not intraday_entry_window:
                 print(
                     f"{datetime.now():%H:%M:%S} | "
-                    f"OPENING MODE | "
-                    f"no additional intraday entries"
+                    f"INTRADAY | outside entry window"
                 )
                 time.sleep(60)
+                continue
+
+            # Avoid scanning the whole universe once the daily trade
+            # allowance has already been used.
+            if state["trades"] >= int(CFG["max_trades_per_day"]):
+                print(
+                    f"{datetime.now():%H:%M:%S} | "
+                    f"INTRADAY | daily trade limit reached"
+                )
+                time.sleep(300)
                 continue
 
             current_positions = get_positions()
@@ -1965,7 +2246,8 @@ def market_loop():
                     if len(telegram_signals) > 100:
                         del telegram_signals[:-100]
                 if (
-                    probability
+                    telegram_trading_enabled
+                    and probability
                     >= float(CFG["probability_threshold"])
                     and trade_score
                     >= float(CFG["trade_score_threshold"])
@@ -1979,8 +2261,26 @@ def market_loop():
                         row,
                     )
 
-            # Avoid repeatedly processing the same completed bar.
-            time.sleep(300)
+            # 5-MIN BAR SYNC:
+            # Wait until the next exact 5-minute boundary,
+            # then give market data 2 seconds to settle.
+            now_epoch = time.time()
+            next_bar_epoch = (
+                (int(now_epoch) // 300 + 1) * 300
+            ) + 2
+
+            sleep_seconds = max(
+                1.0,
+                next_bar_epoch - time.time()
+            )
+
+            print(
+                f"{datetime.now():%H:%M:%S} | "
+                f"INTRADAY | next 5-min scan in "
+                f"{sleep_seconds:.1f}s"
+            )
+
+            time.sleep(sleep_seconds)
 
         except KeyboardInterrupt:
             print()
