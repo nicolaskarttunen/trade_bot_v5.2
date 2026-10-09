@@ -1915,8 +1915,9 @@ def check_filled_orders():
                     state = get_daily_state()
                     state["trades"] += 1
                     traded_symbols = state.setdefault("traded_symbols", [])
-                    if symbol not in traded_symbols:
-                        traded_symbols.append(symbol)
+                    filled_symbol = str(order.symbol)
+                    if filled_symbol not in traded_symbols:
+                        traded_symbols.append(filled_symbol)
                     save_state(state)
 
                     print(
