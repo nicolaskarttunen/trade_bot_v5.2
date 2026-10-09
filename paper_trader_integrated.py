@@ -339,7 +339,10 @@ def get_bars(symbol, limit=250):
         timeframe=TimeFrame(5, TimeFrameUnit.Minute),
         start=start,
         end=end,
-        limit=limit,
+        # Request enough history that Alpaca cannot truncate us to
+        # the oldest 250 bars in the lookback window. We trim to the
+        # caller-requested number only after sorting by timestamp.
+        limit=max(int(limit), 1000),
         feed=CFG["feed"],
     )
 
@@ -367,7 +370,52 @@ def get_bars(symbol, limit=250):
     if not all(column in df.columns for column in needed):
         return pd.DataFrame()
 
-    return df[needed].copy()
+    clean = df[needed].copy()
+    clean["timestamp"] = pd.to_datetime(
+        clean["timestamp"],
+        utc=True,
+        errors="coerce",
+    )
+    clean = clean.dropna(subset=["timestamp"])
+    clean = clean.sort_values("timestamp")
+    clean = clean.drop_duplicates(
+        subset=["timestamp"],
+        keep="last",
+    )
+
+    # Always return the newest bars, never the oldest bars from the
+    # requested lookback window.
+    return clean.tail(int(limit)).reset_index(drop=True)
+
+
+def is_fresh_intraday_row(symbol, row, max_age_minutes=12.0):
+    """Fail closed when an intraday ML signal is based on stale bars."""
+    try:
+        timestamp = pd.Timestamp(row["timestamp"])
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+        else:
+            timestamp = timestamp.tz_convert("UTC")
+
+        now_utc = pd.Timestamp.now(tz="UTC")
+        age_minutes = (now_utc - timestamp).total_seconds() / 60.0
+
+        if age_minutes < -1.0 or age_minutes > float(max_age_minutes):
+            print(
+                f"STALE DATA BLOCK | {symbol} | "
+                f"bar={timestamp.isoformat()} | "
+                f"age_min={age_minutes:.1f}"
+            )
+            return False
+
+        return True
+
+    except Exception as exc:
+        print(
+            f"STALE DATA BLOCK | {symbol} | "
+            f"timestamp check failed | {exc!r}"
+        )
+        return False
 
 
 def get_benchmark():
@@ -2320,6 +2368,12 @@ def market_loop():
                 probability, row = get_ml_probability(symbol)
 
                 if probability is None:
+                    continue
+
+                # Intraday entries must use a recent 5-minute bar.
+                # If Alpaca returns stale history, fail closed instead
+                # of placing an order from an old signal.
+                if not is_fresh_intraday_row(symbol, row):
                     continue
 
                 recent_news, news_change = get_news_signal(symbol)
