@@ -115,8 +115,11 @@ def load_symbol(symbol, market):
     if not path.exists():
         return None
 
-    news_path = NEWS_DIR / f"{symbol}_news.csv"
-    news = pd.read_csv(news_path) if news_path.exists() else None
+    # Historical news is available for only a few symbols.
+    # Avoid unequal data availability across the universe:
+    # hold news neutral for EVERY symbol in this selection-only A/B/C test.
+    # This does not reproduce the live news signal, so OOS returns remain proxies.
+    news = None
 
     x = enrich(
         pd.read_csv(path),
