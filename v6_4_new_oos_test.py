@@ -1,4 +1,9 @@
-"""V6.4 untouched future holdout for previously chosen SPY +0.10% gate.\n\nTrains only through 2026-08-31, tests 2026-09-01..2026-10-19.\nNo future leakage, no parameter tuning, no production changes.\n"""\nimport json\nfrom pathlib import Path
+"""V6.4 untouched future holdout for previously chosen SPY +0.10% gate.
+
+Trains only through 2026-08-31, tests 2026-09-01..2026-10-19.
+No future leakage, no parameter tuning, no production changes.
+"""
+import json\nfrom pathlib import Path
 
 import numpy as np
 import pandas as pd
