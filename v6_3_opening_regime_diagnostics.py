@@ -56,6 +56,21 @@ def build_day_cache(trades: pd.DataFrame) -> dict:
         if not path.exists():
             raise FileNotFoundError(f"Missing historical OHLC file: {path}")
         bars = load_bars(path)
+        if symbol != "SPY":
+            # V6.2 simulates exits on its enriched-and-labeled row set.
+            # Reproduce the rows lost to its 20-bar volume-ratio warmup,
+            # undefined 14-bar RSI when there are no down moves, and its
+            # last three unlabelable bars. Using raw OHLC unfiltered can
+            # otherwise create false replay mismatches, especially on Aug 31.
+            close = bars["close"]
+            losses = (-close.diff().clip(upper=0)).rolling(14).mean()
+            arr = np.arange(len(bars))
+            valid = (
+                (arr >= 19)
+                & (arr < len(bars) - 3)
+                & (losses.to_numpy() > 0)
+            )
+            bars = bars.loc[valid]
         bars = bars[bars["date"].isin(dates)]
         for date, day in bars.groupby("date", sort=False):
             day_cache[(symbol, date)] = day.reset_index(drop=True)
