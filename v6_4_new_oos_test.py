@@ -3,7 +3,8 @@
 Trains only through 2026-08-31, tests 2026-09-01..2026-10-19.
 No future leakage, no parameter tuning, no production changes.
 """
-import json\nfrom pathlib import Path
+import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
