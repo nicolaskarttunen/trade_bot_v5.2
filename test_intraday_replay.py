@@ -3,7 +3,7 @@ import unittest
 
 import pandas as pd
 
-from intraday_replay import replay_intraday
+from intraday_replay import replay_intraday, session_bounded_label
 
 
 CFG = {
@@ -61,6 +61,21 @@ class IntradayReplayTests(unittest.TestCase):
             scored, prices, sorted(prices), {s: "Technology" for s in prices},
             dict(CFG, **kwargs.pop("config", {})), **kwargs
         )
+
+    def test_label_does_not_use_next_session_close(self):
+        timestamps = pd.to_datetime([
+            "2026-10-01 19:55:00+00:00",
+            "2026-10-02 13:30:00+00:00",
+            "2026-10-02 13:35:00+00:00",
+        ])
+        df = pd.DataFrame({
+            "timestamp": timestamps,
+            "close": [100.0, 150.0, 151.0],
+        })
+        labels = session_bounded_label(df, horizon=1, threshold=0.002)
+        self.assertTrue(pd.isna(labels.iloc[0]["target"]))
+        self.assertEqual(labels.iloc[1]["target"], 1.0)
+        self.assertTrue(pd.isna(labels.iloc[2]["target"]))
 
     def test_buy_uses_next_bar_open_not_signal_bar(self):
         price = bars()
