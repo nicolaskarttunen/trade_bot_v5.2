@@ -9,7 +9,7 @@ retrospective comparison, **NOT** a fresh holdout or a profitable strategy claim
 - V6.5 uses the production-like SYMBOLS sequence and repeatedly scans every
   five minutes from **09:35 to 15:25 ET**, using **only the prior completed**
   5-minute candle for the signal and the **next bar opening price** as fill proxy.
-- The two study arms are (a) no SPY gate and (b) fixed +0.10% threshold on
+- Training labels are computed ONLY from future candles in the same New York\n  session; near-close observations without enough future bars are not labeled.\n- The two study arms are (a) no SPY gate and (b) fixed +0.10% threshold on
   the completed first SPY 09:30 candle. No parameter optimization.
 - One shared paper-like portfolio enforces max open positions (5), gross
   exposure <= 50%, per-position cap <= 10%, per-trade risk budget <= 1%,
