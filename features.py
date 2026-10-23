@@ -39,7 +39,13 @@ def enrich(df, market=None, news=None, news_decay_minutes=120, news_lookback_min
         x=pd.merge_asof(x.sort_values("timestamp"),n,left_on="timestamp",right_on="news_timestamp",
                         direction="backward",tolerance=pd.Timedelta(minutes=news_lookback_minutes))
         age=(x["timestamp"]-x["news_timestamp"]).dt.total_seconds()/60.0
-        x["news_score"]=x["news_sentiment"].fillna(0.0)*np.exp(-np.maximum(age,0)/max(news_decay_minutes,1))
+        # A missing news timestamp is NEUTRAL, not NaN. Otherwise missing
+        # news can drop unrelated training signals and execution-price rows.
+        age=age.fillna(0.0)
+        x["news_score"]=(
+            x["news_sentiment"].fillna(0.0)
+            * np.exp(-np.maximum(age,0)/max(news_decay_minutes,1))
+        )
         x=x.drop(columns=["news_timestamp","sentiment"],errors="ignore")
     return x
 
