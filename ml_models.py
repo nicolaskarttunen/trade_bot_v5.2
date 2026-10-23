@@ -28,7 +28,39 @@ class RandomLinearEnsemble:
         probs=[m.predict_proba(np.asarray(X)[:,cols])[:,1] for cols,m in self.models_]; p=np.mean(probs,axis=0); return np.column_stack([1-p,p])
 
 class CentroidClassifier:
-    def fit(self,X,y):
-        X=np.asarray(X,dtype=float); y=np.asarray(y); self.scaler_=Standardizer().fit(X); Z=self.scaler_.transform(X); self.c0_=np.mean(Z[y==0],axis=0); self.c1_=np.mean(Z[y==1],axis=0); return self
-    def predict_proba(self,X):
-        Z=self.scaler_.transform(X); d0=np.sum((Z-self.c0_)**2,axis=1); d1=np.sum((Z-self.c1_)**2,axis=1); z=np.clip((d0-d1)/max(np.std(d0-d1),1e-6),-10,10); p=1/(1+np.exp(-z)); return np.column_stack([1-p,p])
+    """Distance-based classifier with a TRAINING-ONLY margin scale.
+
+    Model artifacts fitted with the old implementation must be retrained.
+    Never estimate a normalization factor from an inference batch: it causes
+    future data leakage and inconsistent live vs. historical predictions.
+    """
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y)
+        if X.ndim != 2 or X.shape[0] != y.shape[0]:
+            raise ValueError("X must be a 2D matrix with one label per row")
+        if not np.any(y == 0) or not np.any(y == 1):
+            raise ValueError("Both classes are required to fit CentroidClassifier")
+        self.scaler_ = Standardizer().fit(X)
+        Z = self.scaler_.transform(X)
+        self.c0_ = np.mean(Z[y == 0], axis=0)
+        self.c1_ = np.mean(Z[y == 1], axis=0)
+        margin = self._margins(Z)
+        self.margin_scale_ = max(float(np.std(margin)), 1e-6)
+        return self
+
+    def _margins(self, Z):
+        d0 = np.sum((Z - self.c0_) ** 2, axis=1)
+        d1 = np.sum((Z - self.c1_) ** 2, axis=1)
+        return d0 - d1
+
+    def predict_proba(self, X):
+        if not hasattr(self, "margin_scale_"):
+            raise RuntimeError(
+                "Old CentroidClassifier artifact lacks training scale. "
+                "Retrain the ensemble before using this model."
+            )
+        Z = self.scaler_.transform(X)
+        z = np.clip(self._margins(Z) / self.margin_scale_, -10, 10)
+        p = 1 / (1 + np.exp(-z))
+        return np.column_stack([1 - p, p])
