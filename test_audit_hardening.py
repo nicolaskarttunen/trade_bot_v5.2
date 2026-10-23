@@ -1,5 +1,7 @@
 """Regression tests for critical audit fixes; no API keys or network needed."""
 import unittest
+import ast
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -80,6 +82,25 @@ class AuditFixTests(unittest.TestCase):
         entry, path = next_entry_and_path(bars, ts[0])
         self.assertIsNone(entry)
         self.assertTrue(path.empty)
+
+    def test_paper_position_lookup_fails_closed(self):
+        # Extract just this pure function; never import the trading process
+        # because importing paper_trader_integrated.py can have side effects.
+        path = Path(__file__).with_name("paper_trader_integrated.py")
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        function = next(node for node in tree.body
+                        if isinstance(node, ast.FunctionDef)
+                        and node.name == "get_positions")
+        module = ast.Module(body=[function], type_ignores=[])
+
+        class BrokenBroker:
+            def get_all_positions(self):
+                raise ConnectionError("simulated Alpaca outage")
+
+        namespace = {"trading": BrokenBroker()}
+        exec(compile(module, str(path), "exec"), namespace)
+        with self.assertRaisesRegex(RuntimeError, "POSITION LOOKUP FAILED"):
+            namespace["get_positions"]()
 
     def test_stop_gap_uses_open_not_optimistic_stop_price(self):
         ts = pd.to_datetime(["2026-10-01T13:35:00Z"])
