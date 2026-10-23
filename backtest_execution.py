@@ -40,6 +40,8 @@ def simulate_long_exit(path, stop, target, slippage_fraction):
         opening = float(bar.open)
         if opening <= stop:
             return opening * (1.0 - slippage_fraction), "stop_gap", bar.timestamp
+        if opening >= target:
+            return target * (1.0 - slippage_fraction), "target_gap", bar.timestamp
         if float(bar.low) <= stop:
             return stop * (1.0 - slippage_fraction), "stop", bar.timestamp
         if opening >= target or float(bar.high) >= target:

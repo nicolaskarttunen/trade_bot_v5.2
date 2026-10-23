@@ -20,7 +20,10 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-from features import enrich, FEATURES
+from features import enrich, FEATURES, completed_bars
+from model_pipeline import validate_bundle, latest_signal, trade_score
+from news_features import news_scores
+from alpaca.common.enums import Sort
 
 
 # =====================================================# V5.2 INTEGRATED PAPER TRADER
@@ -33,6 +36,7 @@ CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
 
 with open(BASE / "models" / "ensemble.pkl", "rb") as f:
     MODEL = pickle.load(f)
+validate_bundle(MODEL, CFG, live=True)
 
 API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
@@ -136,11 +140,13 @@ def process_news(raw):
         if isinstance(symbols, str):
             symbols = [symbols]
 
-        unique_id = f"{raw.get('id', '')}|{created_at}"
+        unique_id = f"{raw.get('id', '')}|{created_at}|{raw.get('updated_at') or created_at}"
 
         item = {
             "id": unique_id,
             "created_at": str(created_at),
+            "updated_at": str(raw.get("updated_at") or created_at),
+            "received_at": datetime.now(timezone.utc).isoformat(),
             "symbols": list(symbols),
             "headline": headline,
             "summary": summary,
@@ -168,71 +174,14 @@ def process_news(raw):
 
 
 def get_news_signal(symbol):
-    """
-    Returns:
-        recent_score: -1..+1
-        change_score: -1..+1
-
-    Same general scale as the historical news_score feature.
-    """
-
-    now = datetime.now(timezone.utc)
-
-    recent = []
-    previous = []
-
+    """Same receipt-aware feature as training; change is diagnostic only."""
+    now = pd.Timestamp.now(tz="UTC")
     with news_lock:
-        items = list(news_items)
-
-    for item in items:
-        if symbol not in (item.get("symbols") or []):
-            continue
-
-        try:
-            timestamp = pd.Timestamp(
-                item["created_at"]
-            ).tz_convert("UTC").to_pydatetime()
-        except Exception:
-            continue
-
-        age_minutes = (now - timestamp).total_seconds() / 60.0
-
-        if age_minutes < 0 or age_minutes > 360:
-            continue
-
-        weight = math.exp(
-            -age_minutes / max(float(CFG["news_decay_minutes"]), 1.0)
-        )
-
-        value = (
-            float(item.get("sentiment", 0.0))
-            * float(item.get("impact", 1.0))
-            * weight
-        )
-
-        if age_minutes <= 30:
-            recent.append((value, weight))
-        else:
-            previous.append((value, weight))
-
-    def weighted(values):
-        if not values:
-            return 0.0
-
-        numerator = sum(value for value, weight in values)
-        denominator = sum(weight for value, weight in values)
-
-        return numerator / denominator if denominator else 0.0
-
-    recent_score = weighted(recent)
-    previous_score = weighted(previous)
-
-    change = recent_score - previous_score
-
-    return (
-        max(-1.0, min(1.0, recent_score)),
-        max(-1.0, min(1.0, change)),
-    )
+        items = [dict(item) for item in news_items
+                 if symbol in (item.get("symbols") or [])]
+    score = float(news_scores([now], items, CFG["news_decay_minutes"],
+                              CFG["news_lookback_minutes"], require_received=True)[0])
+    return score, 0.0
 
 
 def news_stream_loop():
@@ -339,10 +288,10 @@ def get_bars(symbol, limit=250):
         timeframe=TimeFrame(5, TimeFrameUnit.Minute),
         start=start,
         end=end,
-        # Request enough history that Alpaca cannot truncate us to
-        # the oldest 250 bars in the lookback window. We trim to the
-        # caller-requested number only after sorting by timestamp.
-        limit=max(int(limit), 1000),
+        # Explicit descending request; one extra slot for a forming candle.
+        # Sort ascending and discard incomplete bars before feature calculation.
+        limit=int(limit) + 1,
+        sort=Sort.DESC,
         feed=CFG["feed"],
     )
 
@@ -385,10 +334,10 @@ def get_bars(symbol, limit=250):
 
     # Always return the newest bars, never the oldest bars from the
     # requested lookback window.
-    return clean.tail(int(limit)).reset_index(drop=True)
+    return completed_bars(clean, end).tail(int(limit)).reset_index(drop=True)
 
 
-def is_fresh_intraday_row(symbol, row, max_age_minutes=12.0):
+def is_fresh_intraday_row(symbol, row):
     """Fail closed when an intraday ML signal is based on stale bars."""
     try:
         timestamp = pd.Timestamp(row["timestamp"])
@@ -400,7 +349,8 @@ def is_fresh_intraday_row(symbol, row, max_age_minutes=12.0):
         now_utc = pd.Timestamp.now(tz="UTC")
         age_minutes = (now_utc - timestamp).total_seconds() / 60.0
 
-        if age_minutes < -1.0 or age_minutes > float(max_age_minutes):
+        expected = now_utc.floor("5min") - pd.Timedelta(minutes=5)
+        if timestamp != expected:
             print(
                 f"STALE DATA BLOCK | {symbol} | "
                 f"bar={timestamp.isoformat()} | "
@@ -419,52 +369,21 @@ def is_fresh_intraday_row(symbol, row, max_age_minutes=12.0):
 
 
 def get_benchmark():
-    benchmark = get_bars(BENCHMARK, 250)
-    if benchmark.empty:
-        return benchmark
-    benchmark = enrich(benchmark)
-    return benchmark[['timestamp', 'close', 'atr_pct']].copy()
+    return get_bars(BENCHMARK, 250)
 
 
 def get_ml_probability(symbol):
-    df = get_bars(symbol)
-
-    if len(df) < 60:
-        return None, None
-
+    # Fix the decision time before fetching both inputs. Ignore bars completing
+    # during a long request; the caller's freshness check can then reject it.
+    as_of = pd.Timestamp.now(tz="UTC")
+    df = get_bars(symbol, 250)
     benchmark = get_benchmark()
-
-    recent_news, _ = get_news_signal(symbol)
-
-    enriched = enrich(
-        df,
-        market=benchmark,
-        news=None,
-        news_decay_minutes=CFG["news_decay_minutes"],
-        news_lookback_minutes=CFG["news_lookback_minutes"],
-    )
-
-    # Live news signal is kept on the same -1..1 scale as the
-    # historical news feature used during model training.
-    enriched["news_score"] = recent_news
-
-    enriched = enriched.dropna(subset=FEATURES)
-
-    if enriched.empty:
+    if df.empty or benchmark.empty:
         return None, None
-
-    row = enriched.iloc[-1]
-
-    X = row[FEATURES].to_numpy(dtype=float).reshape(1, -1)
-
-    probabilities = []
-
-    for model in MODEL["models"]:
-        probabilities.append(
-            float(model.predict_proba(X)[:, 1][0])
-        )
-
-    return float(np.mean(probabilities)), row
+    with news_lock:
+        items = [dict(item) for item in news_items
+                 if symbol in (item.get("symbols") or [])]
+    return latest_signal(df, benchmark, items, MODEL, CFG, as_of)
 
 
 # ------------------------------------------------------------
@@ -672,7 +591,7 @@ def save_notified_order_ids(order_ids):
 def get_daily_state():
     state = load_state()
 
-    today = datetime.now().date().isoformat()
+    today = pd.Timestamp.now(tz="America/New_York").date().isoformat()
 
     account = trading.get_account()
     equity = float(account.equity)
@@ -753,20 +672,13 @@ def has_open_buy_order(symbol):
     """Return True if an active BUY order already exists for this symbol."""
     try:
         orders = trading.get_orders()
-        active_statuses = {
-            "new",
-            "accepted",
-            "pending_new",
-            "partially_filled",
-            "pending_replace",
-            "accepted_for_bidding",
-        }
+        terminal_statuses = {"filled", "canceled", "expired", "rejected", "replaced"}
 
         for order in orders:
             if (
                 order.symbol == symbol
                 and str(order.side).lower().endswith("buy")
-                and str(order.status).lower() in active_statuses
+                and _enum_text(order.status) not in terminal_statuses
             ):
                 return True
 
@@ -784,14 +696,7 @@ def _enum_text(value):
 
 def _active_buy_orders():
     """Return active BUY orders. Fail closed by raising on API errors."""
-    active_statuses = {
-        "new",
-        "accepted",
-        "pending_new",
-        "partially_filled",
-        "pending_replace",
-        "accepted_for_bidding",
-    }
+    terminal_statuses = {"filled", "canceled", "expired", "rejected", "replaced"}
 
     try:
         orders = trading.get_orders()
@@ -802,7 +707,7 @@ def _active_buy_orders():
         order
         for order in orders
         if _enum_text(order.side) == "buy"
-        and _enum_text(order.status) in active_statuses
+        and _enum_text(order.status) not in terminal_statuses
     ]
 
 
@@ -995,24 +900,7 @@ def write_trade(
 # ------------------------------------------------------------
 
 def calculate_trade_score(probability, row, news_score):
-    market_return = float(row.get("market_ret_3", 0.0))
-
-    market_component = 1.0 if market_return > 0 else 0.0
-
-    ml_component = max(
-        0.0,
-        min(1.0, (probability - 0.5) / 0.5)
-    )
-
-    news_component = (news_score + 1.0) / 2.0
-
-    score = 100.0 * (
-        float(CFG["ml_weight"]) * ml_component
-        + float(CFG["market_weight"]) * market_component
-        + float(CFG["news_weight"]) * news_component
-    )
-
-    return score
+    return float(trade_score(probability, row["market_ret_3"], news_score, CFG))
 
 
 
@@ -1332,7 +1220,17 @@ def flatten_end_of_day(seconds_to_close=None):
         return False
 
     if not positions:
-        print("EOD VERIFIED | portfolio flat")
+        try:
+            trading.cancel_orders()
+            remaining_orders = trading.get_orders()
+            remaining_positions = trading.get_all_positions()
+        except Exception as exc:
+            print("EOD FLAT VERIFY ERROR:", repr(exc))
+            return False
+        if remaining_orders or remaining_positions:
+            print("EOD RETRY | pending orders or newly filled positions remain")
+            return False
+        print("EOD VERIFIED | no positions or open orders")
         return True
 
     symbols = [str(position.symbol) for position in positions]
@@ -1378,7 +1276,14 @@ def flatten_end_of_day(seconds_to_close=None):
         return False
 
     if not remaining:
-        print("EOD VERIFIED | all paper positions closed")
+        try:
+            if trading.get_orders():
+                print("EOD RETRY | open orders remain after position close")
+                return False
+        except Exception as exc:
+            print("EOD ORDER VERIFY ERROR:", repr(exc))
+            return False
+        print("EOD VERIFIED | all paper positions and orders closed")
         return True
 
     remaining_symbols = [str(position.symbol) for position in remaining]
@@ -2109,7 +2014,7 @@ def run_opening_scan():
         if probability is None:
             continue
 
-        recent_news, news_change = get_news_signal(symbol)
+        recent_news, news_change = float(row["news_score"]), 0.0
 
         trade_score = calculate_trade_score(
             probability,
@@ -2383,7 +2288,7 @@ def market_loop():
                 if not is_fresh_intraday_row(symbol, row):
                     continue
 
-                recent_news, news_change = get_news_signal(symbol)
+                recent_news, news_change = float(row["news_score"]), 0.0
 
                 trade_score = calculate_trade_score(
                     probability,

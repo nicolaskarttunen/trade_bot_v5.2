@@ -2,10 +2,12 @@ import json,pickle
 from pathlib import Path
 import pandas as pd,numpy as np
 from features import FEATURES,enrich
+from model_pipeline import validate_bundle
 from backtest_execution import next_entry_and_path, simulate_long_exit
 
 BASE=Path(__file__).resolve().parent; cfg=json.loads((BASE/"config.json").read_text())
 with open(BASE/"models/ensemble.pkl","rb") as f: bundle=pickle.load(f)
+validate_bundle(bundle,cfg)
 models=bundle["models"]; data=BASE/"data"; newsdir=BASE/"news"
 bench=enrich(pd.read_csv(data/f"{cfg['benchmark_symbols'][0]}_5min.csv"))
 frames=[]

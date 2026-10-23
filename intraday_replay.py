@@ -4,7 +4,7 @@ Models the production *intraday* 09:35-15:30 ET scans in symbol order.
 OPG/premarket, news latency, partial fills, broker order timing, exact early
 closes and market impact cannot be inferred from five-minute OHLC data.
 """
-from collections import defaultdict
+from features import normalize_bars, label
 
 import numpy as np
 import pandas as pd
@@ -14,27 +14,12 @@ NY = "America/New_York"
 
 
 def session_bounded_label(df, horizon=3, threshold=0.002):
-    """Training target must not use prices from the next New York session.
-
-    The signal's future outcome is restricted to bars on the SAME ET date.
-    Final bars without enough same-date observations stay unlabeled.
-    """
-    if int(horizon) < 1:
-        raise ValueError("horizon must be positive")
-    x = df.copy()
-    timestamps = pd.to_datetime(x["timestamp"], utc=True)
-    session = timestamps.dt.tz_convert(NY).dt.strftime("%Y-%m-%d")
-    future = x.groupby(session, sort=False)["close"].shift(-int(horizon))
-    future_return = future / x["close"] - 1.0
-    x["target"] = np.where(future.notna(), (future_return >= threshold).astype(float), np.nan)
-    return x
+    return label(df, horizon=horizon, threshold=threshold)
 
 
 def as_day_clock(bars):
     """Normalize full OHLC bars to New York date and bar START clock."""
-    x = bars.copy()
-    x["timestamp"] = pd.to_datetime(x["timestamp"], utc=True)
-    x = x.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    x = normalize_bars(bars)
     x["date"] = x["timestamp"].dt.tz_convert(NY).dt.strftime("%Y-%m-%d")
     x["clock"] = x["timestamp"].dt.tz_convert(NY).dt.strftime("%H:%M")
     return x
@@ -49,14 +34,37 @@ def _book(df):
 
 def _signal_book(df):
     x = df.copy()
-    if "trade_date" not in x:
-        x["trade_date"] = pd.to_datetime(x["timestamp"], utc=True).dt.tz_convert(NY).dt.strftime("%Y-%m-%d")
-    if "clock" not in x:
-        x["clock"] = pd.to_datetime(x["timestamp"], utc=True).dt.tz_convert(NY).dt.strftime("%H:%M")
-    return {
-        (str(row["trade_date"]), str(row["clock"])): row
-        for _, row in x.iterrows()
-    }
+    ts = pd.to_datetime(x["timestamp"], utc=True)
+    if ts.isna().any() or ts.duplicated().any() or (ts != ts.dt.floor("5min")).any():
+        raise ValueError("Invalid or duplicate signal timestamps")
+    # Caller-supplied date/clock columns cannot move a future signal backwards.
+    x["trade_date"] = ts.dt.tz_convert(NY).dt.strftime("%Y-%m-%d")
+    x["clock"] = ts.dt.tz_convert(NY).dt.strftime("%H:%M")
+    if "signal_available_at" in x:
+        available = pd.to_datetime(x["signal_available_at"], utc=True)
+        if (available != ts + pd.Timedelta(minutes=5)).any():
+            raise ValueError("Signal availability must be the bar close")
+    return {(str(row["trade_date"]), str(row["clock"])): row for _, row in x.iterrows()}
+
+
+def validate_config(cfg):
+    positive = ["initial_cash", "stop_atr_multiplier", "reward_risk_ratio"]
+    fractions = ["max_daily_loss_pct", "max_position_pct", "max_total_exposure_pct", "risk_per_trade_pct"]
+    for key in positive + fractions + ["slippage_bps", "spread_bps", "commission_per_trade",
+                                        "probability_threshold", "trade_score_threshold"]:
+        value = float(cfg.get(key, 0))
+        if not np.isfinite(value) or value < 0 or (key in positive and value <= 0):
+            raise ValueError(f"Invalid config: {key}")
+        if key in fractions and not 0 < value <= 1:
+            raise ValueError(f"Invalid fraction: {key}")
+    for key in ["max_trades_per_day", "max_open_positions"]:
+        value = float(cfg[key])
+        if not np.isfinite(value) or int(value) != value or value < 1:
+            raise ValueError(f"Invalid count: {key}")
+    if float(cfg["slippage_bps"]) + float(cfg["spread_bps"]) >= 10000:
+        raise ValueError("Execution costs must be below 100%")
+    if float(cfg["probability_threshold"]) > 1 or float(cfg["trade_score_threshold"]) > 100:
+        raise ValueError("Invalid decision threshold")
 
 
 def _previous_clock(clock):
@@ -66,7 +74,7 @@ def _previous_clock(clock):
 
 
 def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, cfg,
-                    spy_opening_gate=None, require_spy=False):
+                    spy_opening_gate=None, require_spy=False, session_closes=None):
     """Return (cash_equity, trades, daily, five_minute_equity).
 
     Scan at 09:35, 09:40, ... 15:25 ET using only the PREVIOUS completed
@@ -77,8 +85,12 @@ def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, c
 
     The SPY filter is available after 09:35; it is NEVER applied to OPG.
     """
-    if not symbols:
-        raise ValueError("symbols cannot be empty")
+    validate_config(cfg)
+    if not symbols or len(set(symbols)) != len(symbols):
+        raise ValueError("symbols must be nonempty and unique")
+    missing = set(symbols) - set(full_prices_by_symbol)
+    if missing:
+        raise ValueError(f"Missing price coverage: {sorted(missing)}")
     slip = (float(cfg["slippage_bps"]) + float(cfg["spread_bps"])) / 10000.0
     initial = float(cfg["initial_cash"])
     cash = initial
@@ -89,8 +101,7 @@ def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, c
     prices = {s: _book(full_prices_by_symbol[s]) for s in symbols if s in full_prices_by_symbol}
     signals = {s: _signal_book(scored_by_symbol[s]) for s in symbols if s in scored_by_symbol}
     days = sorted({d for symbol_bars in prices.values() for d, clock in symbol_bars})
-    all_clock = [f"{minute//60:02d}:{minute%60:02d}"
-                 for minute in range(9*60+30, 15*60+55, 5)]
+    strict = bool(cfg.get("strict_price_coverage", True))
 
     def equity(mark_prices=None):
         marks = mark_prices or {}
@@ -111,7 +122,11 @@ def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, c
             qty=position["qty"],
             pnl=(float(price)-position["entry"]) * position["qty"] -
                 float(cfg.get("commission_per_trade", 0)),
-            stop=position["stop"], target=position["target"], reason=reason
+            stop=position["stop"], target=position["target"], reason=reason,
+            entry_equity=position["entry_equity"],
+            planned_stop_loss=position["planned_stop_loss"],
+            entry_exposure=position["entry_exposure"],
+            post_entry_equity=position["post_entry_equity"]
         )
         trades.append(trade)
 
@@ -120,6 +135,15 @@ def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, c
         count = 0
         start_equity = equity()
         day_closed = False
+        close_clock = "16:00" if session_closes is None else session_closes.get(date)
+        if close_clock is None:
+            raise ValueError(f"Missing session calendar for {date}")
+        session_close = pd.Timestamp(f"{date} {close_clock}", tz=NY)
+        if session_close.strftime("%H:%M") not in {"13:00", "16:00"}:
+            raise ValueError(f"Unsupported session close: {close_clock}")
+        flatten_clock = (session_close - pd.Timedelta(minutes=10)).strftime("%H:%M")
+        all_clock = [t.strftime("%H:%M") for t in pd.date_range(
+            pd.Timestamp(f"{date} 09:30", tz=NY), session_close - pd.Timedelta(minutes=10), freq="5min")]
 
         for clock in all_clock:
             current = {s: prices[s].get((date, clock)) for s in symbols if s in prices}
@@ -127,7 +151,11 @@ def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, c
             if not current and not positions:
                 continue
             mark_open = {s: float(row["open"]) for s, row in current.items()}
-            ts = next((r["timestamp"] for r in current.values()), pd.Timestamp(date, tz="UTC"))
+            ts = pd.Timestamp(f"{date} {clock}", tz=NY).tz_convert("UTC")
+            if strict:
+                for held in positions:
+                    if held not in current:
+                        raise ValueError(f"Unobservable held position {held} at {ts}; replay invalid")
 
             # Stop/target gaps occur before any new BUY at this same bar open.
             for symbol in list(positions):
@@ -143,7 +171,7 @@ def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, c
                     close_position(symbol, pos["target"]*(1-slip), "target_gap", bar["timestamp"])
 
             # 15:50 ET approximation to production start-flattening near EOD.
-            if clock == "15:50":
+            if clock == flatten_clock:
                 for symbol in list(positions):
                     bar = current.get(symbol)
                     px = float(bar["open"]) if bar is not None else positions[symbol]["last_price"]
@@ -152,7 +180,7 @@ def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, c
                 curve.append({"date": date, "clock": clock, "equity": equity()})
                 break
 
-            if "09:35" <= clock < "15:30":
+            if "09:35" <= clock < min("15:30", flatten_clock):
                 gated = require_spy and not bool((spy_opening_gate or {}).get(date, False))
                 prev = _previous_clock(clock)
                 for order, symbol in enumerate(symbols):
@@ -165,6 +193,8 @@ def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, c
                     if signal is None or bar is None:
                         continue
                     ml = float(signal["ml_prob"])
+                    if not np.isfinite(float(signal["news_score"])):
+                        raise ValueError("Invalid news score")
                     score = float(signal["trade_score"])
                     if not (np.isfinite(ml) and np.isfinite(score)
                             and ml >= float(cfg["probability_threshold"])
@@ -187,18 +217,29 @@ def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, c
                     target = round(reference+dist*float(cfg["reward_risk_ratio"]), 2)
                     if stop <= 0 or stop >= entry or target <= entry:
                         continue
-                    # Live sizing uses the latest trade reference, while the
-                    # historical fill uses next-bar OPEN plus spread/slippage.
-                    risk_qty = int(available_equity*float(cfg["risk_per_trade_pct"])/dist)
-                    cap_qty = int(available_equity*float(cfg["max_position_pct"])/reference)
+                    # Include modeled entry/stop execution costs in the risk
+                    # budget. commission_per_trade is one ROUND-TRIP fee,
+                    # charged at exit and reserved here.
+                    commission = float(cfg.get("commission_per_trade", 0))
+                    loss_per_share = entry - stop * (1-slip)
+                    risk_qty = int(max(0., available_equity*float(cfg["risk_per_trade_pct"])-commission)/loss_per_share)
+                    cost_per_share = entry - reference
+                    cap = float(cfg["max_position_pct"])
+                    cap_qty = int(available_equity*cap/(entry + cap*cost_per_share))
                     exposure = sum(p["qty"]*p["last_price"] for p in positions.values())
-                    exposure_qty = int(max(0.0, available_equity*float(cfg["max_total_exposure_pct"])-exposure)/reference)
-                    qty = min(risk_qty, cap_qty, exposure_qty)
-                    if qty < 1 or cash < qty*entry:
+                    cap = float(cfg["max_total_exposure_pct"])
+                    exposure_qty = int(max(0., available_equity*cap-exposure)/(entry + cap*cost_per_share))
+                    cash_qty = int(max(0., cash-commission*(len(positions)+1))/entry)
+                    qty = min(risk_qty, cap_qty, exposure_qty, cash_qty)
+                    if qty < 1:
                         continue
                     cash -= entry*qty
                     positions[symbol] = {
                         "entry_ts": bar["timestamp"],
+                        "entry_equity": available_equity,
+                        "planned_stop_loss": qty*loss_per_share + commission,
+                        "entry_exposure": exposure + qty*entry,
+                        "post_entry_equity": available_equity - qty*cost_per_share,
                         "entry": entry, "qty": qty, "stop": stop,
                         "target": target, "last_price": reference,
                         "signal": {
@@ -220,9 +261,9 @@ def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, c
                     continue
                 pos = positions[symbol]
                 if float(bar["low"]) <= pos["stop"]:
-                    close_position(symbol, pos["stop"]*(1-slip), "stop", bar["timestamp"])
+                    close_position(symbol, pos["stop"]*(1-slip), "stop", bar["timestamp"] + pd.Timedelta(minutes=5))
                 elif float(bar["high"]) >= pos["target"]:
-                    close_position(symbol, pos["target"]*(1-slip), "target", bar["timestamp"])
+                    close_position(symbol, pos["target"]*(1-slip), "target", bar["timestamp"] + pd.Timedelta(minutes=5))
                 else:
                     pos["last_price"] = float(bar["close"])
             mark_close = {s: float(r["close"]) for s, r in current.items()}
@@ -233,7 +274,7 @@ def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, c
         if positions and not day_closed:
             for symbol in list(positions):
                 px = positions[symbol]["last_price"]
-                close_position(symbol, px*(1-slip), "missing_eod_approx", pd.Timestamp(date, tz="UTC"))
+                close_position(symbol, px*(1-slip), "missing_eod_approx", session_close.tz_convert("UTC"))
         daily.append({
             "date": date, "start_equity": start_equity,
             "pnl": equity()-start_equity, "end_equity": equity(),

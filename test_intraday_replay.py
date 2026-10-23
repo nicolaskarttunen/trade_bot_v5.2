@@ -25,7 +25,7 @@ CFG = {
 
 
 def bars(symbol_price=100., day="2026-10-01", low_override=None):
-    times = ["09:30", "09:35", "09:40", "09:45", "15:50"]
+    times = [t.strftime("%H:%M") for t in pd.date_range("2000-01-01 09:30", "2000-01-01 15:50", freq="5min")]
     timestamps = pd.to_datetime(
         [f"{day} {t}" for t in times]
     ).tz_localize("America/New_York").tz_convert("UTC")
