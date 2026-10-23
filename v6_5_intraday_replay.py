@@ -11,7 +11,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from features import FEATURES, enrich, label
+from features import FEATURES, enrich
+from intraday_replay import session_bounded_label
 from ml_models import LogisticGD, RandomLinearEnsemble, CentroidClassifier
 from intraday_replay import replay_intraday, as_day_clock
 
@@ -150,7 +151,7 @@ def load_symbol(symbol, market):
         news_decay_minutes=CFG["news_decay_minutes"],
         news_lookback_minutes=CFG["news_lookback_minutes"],
     )
-    x = label(
+    x = session_bounded_label(
         x,
         horizon=CFG["label_horizon_bars"],
         threshold=CFG["label_threshold_pct"],
