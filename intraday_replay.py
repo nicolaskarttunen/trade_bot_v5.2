@@ -13,6 +13,23 @@ import pandas as pd
 NY = "America/New_York"
 
 
+def session_bounded_label(df, horizon=3, threshold=0.002):
+    """Training target must not use prices from the next New York session.
+
+    The signal's future outcome is restricted to bars on the SAME ET date.
+    Final bars without enough same-date observations stay unlabeled.
+    """
+    if int(horizon) < 1:
+        raise ValueError("horizon must be positive")
+    x = df.copy()
+    timestamps = pd.to_datetime(x["timestamp"], utc=True)
+    session = timestamps.dt.tz_convert(NY).dt.strftime("%Y-%m-%d")
+    future = x.groupby(session, sort=False)["close"].shift(-int(horizon))
+    future_return = future / x["close"] - 1.0
+    x["target"] = np.where(future.notna(), (future_return >= threshold).astype(float), np.nan)
+    return x
+
+
 def as_day_clock(bars):
     """Normalize full OHLC bars to New York date and bar START clock."""
     x = bars.copy()
