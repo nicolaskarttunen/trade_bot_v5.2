@@ -1,0 +1,25 @@
+name: Audit and intraday replay tests
+
+on:
+  push:
+    branches: [audit-hardening-v1]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install offline test dependencies
+        run: python -m pip install numpy pandas
+      - name: Syntax check
+        run: python -m py_compile ml_models.py features.py backtest_execution.py backtest.py paper_trader_integrated.py intraday_replay.py v6_5_intraday_replay.py test_audit_hardening.py test_intraday_replay.py
+      - name: Offline regression tests (no Alpaca credentials)
+        run: python -m unittest -v test_audit_hardening test_intraday_replay
