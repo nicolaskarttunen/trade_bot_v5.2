@@ -1,5 +1,8 @@
 # Audit hardening v1 — research-only / NOT deployed
 
+**Updated audit and executed test evidence:** [AUDIT_REVIEW_2026-10-23.md](AUDIT_REVIEW_2026-10-23.md).
+The original milestones below describe the earlier base; read the new audit for current status.
+
 Base: `v5.3-experimental` (100-symbol research branch).
 This branch contains reviewable changes; it has not been deployed to the
 Oracle paper-trading service, and its historical profitability has not been
