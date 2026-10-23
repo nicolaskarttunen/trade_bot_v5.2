@@ -733,13 +733,20 @@ def daily_loss_reached(state):
 
 
 def get_positions():
+    """Fail closed if Alpaca cannot confirm the actual open positions.
+
+    Returning an empty dict on an API failure could trigger duplicate entries.
+    Callers may catch the exception for display but MUST block new BUY orders.
+    """
     try:
         return {
             position.symbol: position
             for position in trading.get_all_positions()
         }
-    except Exception:
-        return {}
+    except Exception as exc:
+        raise RuntimeError(
+            "POSITION LOOKUP FAILED: entry processing blocked until Alpaca responds"
+        ) from exc
 
 
 def has_open_buy_order(symbol):
