@@ -17,7 +17,7 @@ import pandas as pd
 BASE = Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(BASE))
 MODULES = ["test_audit_hardening", "test_intraday_replay", "test_pipeline_contract",
-           "test_replay_risk", "test_paper_boundaries", "test_driver_end_to_end", "test_order_lifecycle", "test_offline_simulation"]
+           "test_replay_risk", "test_paper_boundaries", "test_driver_end_to_end", "test_order_lifecycle", "test_offline_simulation", "test_gap_probe"]
 
 
 def main():

@@ -54,7 +54,7 @@ ja kouluttaa demon mallin muistissa muuttamatta `models/ensemble.pkl`:ää.
 
 ## Mitä tulokset tarkoittavat
 
-Ensimmäinen vaihe ajaa **100 automaattista testiä**, mukaan lukien toimeksiantojen
+Ensimmäinen vaihe ajaa nyt **108 automaattista testiä**, mukaan lukien toimeksiantojen
 kadonneet kuittaukset, restart, osatäytöt ja riskirajat. Nämä käyttävät
 valevälittäjää. Varsinainen OHLC-simulaattori ei mallinna samoja välittäjätapahtumia.
 
@@ -128,3 +128,10 @@ paljasti molemmilla pandas-versioilla kaksi virhettä, vaikka Linux-ajot onnistu
 Lisätty regressiotesti varmistaa tietokantakahvan sulkemisen alustusvirheessä.
 Testisarjassa on nyt 100 testiä. Nämä ovat käyttöjärjestelmä-/virheenkäsittelykorjauksia,
 eivät strategiamuutoksia. Vanhaa lokkia ei poisteta tai nollata korjauksena.
+
+## Oikean historian aukkojen selvitys
+
+Käyttäjän 102 tiedoston SIP-aineistosta löydettyjen viiden aukon erillinen,
+vain hintadataa lukeva tarkistus: [GAP_PROBE_2026-10-26.md](GAP_PROBE_2026-10-26.md).
+Kahdeksan lisätestiä nostavat nykyisen testimäärän 108:aan. Varsinainen
+synteettinen toimintademo ja strategian asetukset eivät muutu.
