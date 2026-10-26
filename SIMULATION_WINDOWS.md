@@ -54,7 +54,7 @@ ja kouluttaa demon mallin muistissa muuttamatta `models/ensemble.pkl`:ää.
 
 ## Mitä tulokset tarkoittavat
 
-Ensimmäinen vaihe ajaa **99 automaattista testiä**, mukaan lukien toimeksiantojen
+Ensimmäinen vaihe ajaa **100 automaattista testiä**, mukaan lukien toimeksiantojen
 kadonneet kuittaukset, restart, osatäytöt ja riskirajat. Nämä käyttävät
 valevälittäjää. Varsinainen OHLC-simulaattori ei mallinna samoja välittäjätapahtumia.
 
@@ -86,7 +86,7 @@ botin historiallisina tuottoina. Demotulokset eivät ole strategian kehityskokei
 
 ## Varmennus ja seuraava oikeaan dataan perustuva testi
 
-Käynnistin tarkistettiin Linuxissa Python 3.12:lla; koko komentopolku ajoi 99/99
+Käynnistin tarkistettiin Linuxissa Python 3.12:lla; koko komentopolku ajoi 100/100
 testiä ja valmistui yhdeksän päivän / kahden vertailuhaaran demoon. Sama testisarja
 ajettiin pandas 2.2.3:lla ja 3.0.0:lla. Windows-tarkistus on lisätty GitHub Actionsiin (Windows/Linux × pandas 2.2.3/3.0.0),
 mukaan lukien koko käynnistyskomento. Tarkista ajon toteutunut tila Actionsista;
@@ -110,3 +110,21 @@ käyttöönottoesteitä: erityisesti päivän lopun oikean välittäjäsulun ep�
 kuittaukset ovat edelleen korjaamatta.
 
 Paikalliset ajolokit: [pandas 2.2.3](audit_evidence/2026-10-26-simulation/pandas-2.2.3/test_results.json), [pandas 3.0.0](audit_evidence/2026-10-26-simulation/pandas-3.0.0/test_results.json) ja [demon tilaraportti](audit_evidence/2026-10-26-simulation/demo_report.json).
+
+## Windows-tarkistuksessa löytyneet korjaukset
+
+Ensimmäinen Windows-CI-ajo ([40346579696](https://github.com/nicolaskarttunen/trade_bot_v5.2/actions/runs/40346579696))
+paljasti molemmilla pandas-versioilla kaksi virhettä, vaikka Linux-ajot onnistuivat:
+
+- Prosessilukon luonti yritti lukea toisen kahvan lukitsemaa tavua ennen
+  varsinaista lukitusyritystä. Windows esti tämän jo lukuoperaatiossa.
+  Tiedoston koko tarkistetaan nyt `fstat`-kutsulla lukittua aluetta lukematta,
+  ja alustus kuuluu samaan virheenkäsittelyyn kuin lukitus.
+- SQLite-yhteyden `PRAGMA`-alustus oli ennen `try/finally`-lohkoa.
+  Vioittuneen tietokannan alustusvirhe jätti kahvan auki, jolloin Windows ei
+  pystynyt poistamaan testin väliaikaistiedostoa. Myös alustus kuuluu nyt
+  lohkoon, joka sulkee yhteyden varmasti.
+
+Lisätty regressiotesti varmistaa tietokantakahvan sulkemisen alustusvirheessä.
+Testisarjassa on nyt 100 testiä. Nämä ovat käyttöjärjestelmä-/virheenkäsittelykorjauksia,
+eivät strategiamuutoksia. Vanhaa lokkia ei poisteta tai nollata korjauksena.

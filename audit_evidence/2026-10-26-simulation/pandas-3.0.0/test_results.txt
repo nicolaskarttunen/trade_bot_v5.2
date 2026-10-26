@@ -91,6 +91,7 @@ test_account_mismatch_and_corrupt_database_fail_closed (test_order_lifecycle.Lif
 test_active_stop_requires_correct_price_and_quantity (test_order_lifecycle.LifecycleTests.test_active_stop_requires_correct_price_and_quantity) ... ok
 test_cancel_timeout_blocks_until_parent_reconciled (test_order_lifecycle.LifecycleTests.test_cancel_timeout_blocks_until_parent_reconciled) ... ok
 test_canceled_partial_bracket_needs_manual_protection_reconciliation (test_order_lifecycle.LifecycleTests.test_canceled_partial_bracket_needs_manual_protection_reconciliation) ... ok
+test_connection_setup_failure_closes_database_handle (test_order_lifecycle.LifecycleTests.test_connection_setup_failure_closes_database_handle) ... ok
 test_crash_between_durable_reservation_and_rpc_never_resends (test_order_lifecycle.LifecycleTests.test_crash_between_durable_reservation_and_rpc_never_resends) ... ok
 test_cumulative_fill_regression_is_rejected (test_order_lifecycle.LifecycleTests.test_cumulative_fill_regression_is_rejected) ... ok
 test_daily_attempts_survive_restart_and_rejection (test_order_lifecycle.LifecycleTests.test_daily_attempts_survive_restart_and_rejection) ... ok
@@ -116,6 +117,6 @@ test_existing_run_is_never_overwritten (test_offline_simulation.OfflineSimulatio
 test_failed_driver_leaves_failed_report_and_restores_config (test_offline_simulation.OfflineSimulationTests.test_failed_driver_leaves_failed_report_and_restores_config) ... ok
 
 ----------------------------------------------------------------------
-Ran 99 tests in 4.335s
+Ran 100 tests in 2.819s
 
 OK

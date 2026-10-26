@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 
@@ -86,9 +87,9 @@ class OrderJournal:
     @contextmanager
     def connection(self):
         db = sqlite3.connect(self.path, timeout=5)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA synchronous=FULL")
         try:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA synchronous=FULL")
             yield db
             db.commit()
         except BaseException:
@@ -216,13 +217,14 @@ class ProcessLock:
     """One paper writer per working directory, Windows and POSIX."""
     def __init__(self, path):
         self.file = open(path, "a+b")
-        self.file.seek(0)
-        if not self.file.read(1):
-            self.file.write(b"0")
-            self.file.flush()
-        self.file.seek(0)
         try:
-            if __import__("os").name == "nt":
+            # Reading the locked byte itself fails on Windows before locking().
+            # Inspect file size without reading another writer's locked region.
+            if os.fstat(self.file.fileno()).st_size == 0:
+                self.file.write(b"0")
+                self.file.flush()
+            self.file.seek(0)
+            if os.name == "nt":
                 import msvcrt
                 msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
             else:
@@ -230,7 +232,7 @@ class ProcessLock:
                 fcntl.flock(self.file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (OSError, IOError):
             self.file.close()
-            raise OrderBlocked("Another paper process owns this working directory") from None
+            raise OrderBlocked("Cannot acquire paper writer lock: another process or filesystem error") from None
 
     def close(self):
         self.file.close()

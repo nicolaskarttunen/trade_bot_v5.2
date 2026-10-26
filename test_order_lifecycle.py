@@ -134,6 +134,15 @@ class LifecycleTests(unittest.TestCase):
         broken.write_bytes(b"not sqlite")
         with self.assertRaises(sqlite3.DatabaseError): OrderJournal(broken,"paper-account")
 
+    def test_connection_setup_failure_closes_database_handle(self):
+        connection=Mock()
+        connection.execute.side_effect=sqlite3.DatabaseError("corrupt header")
+        with patch("order_journal.sqlite3.connect",return_value=connection):
+            with self.assertRaises(sqlite3.DatabaseError):
+                with self.journal.connection():
+                    self.fail("Unusable database must not yield a connection")
+        connection.close.assert_called_once()
+
     def test_two_instances_cannot_reserve_same_intent(self):
         other=OrderJournal(self.path,"paper-account")
         cid=client_id("paper-account",SESSION,"A","entry")
