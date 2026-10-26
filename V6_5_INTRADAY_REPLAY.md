@@ -65,3 +65,10 @@ Old +0.65% or other V6.4 values are not comparable validation evidence.
 3. Broker-order reconciliation, partial-fill protection and alerting.
 4. Historical premarket/news data and a separate realistic OPG simulation.
 5. More later uninspected paper observation days.
+
+## Windows offline demonstration
+
+For a separate checkout and credential-free synthetic demonstration, see
+[SIMULATION_WINDOWS.md](SIMULATION_WINDOWS.md). This runs the actual replay
+engine with generated two-stock data and the offline fault suite. It does
+not replace the strict 100-stock historical data requirements above.

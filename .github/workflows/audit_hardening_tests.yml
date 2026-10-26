@@ -10,28 +10,34 @@ permissions:
 
 jobs:
   offline-validation:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         pandas: ['2.2.3', '3.0.0']
     env:
       OPENBLAS_NUM_THREADS: '1'
       OMP_NUM_THREADS: '1'
+      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Install offline test dependencies
-        run: python -m pip install numpy==2.3.5 pandas==${{ matrix.pandas }} alpaca-py==0.44.0
+        run: python -m pip install numpy==2.3.5 pandas==${{ matrix.pandas }} alpaca-py==0.44.0 tzdata==2026.5
       - name: Syntax check active modules (never import the paper process)
-        run: python -m py_compile ml_models.py features.py model_pipeline.py news_features.py research_validation.py train_models.py backtest_execution.py backtest.py paper_trader_integrated.py intraday_replay.py v6_5_intraday_replay.py order_journal.py order_lifecycle.py paper_order_adapter.py
+        run: python -m py_compile ml_models.py features.py model_pipeline.py news_features.py research_validation.py train_models.py backtest_execution.py backtest.py paper_trader_integrated.py intraday_replay.py v6_5_intraday_replay.py order_journal.py order_lifecycle.py paper_order_adapter.py tools/run_offline_simulation.py test_offline_simulation.py
       - name: Offline regressions with outbound sockets blocked
         run: python tools/run_audit_tests.py --output-dir test-artifacts
+      - name: End-user offline simulation command
+        run: python -X utf8 tools/run_offline_simulation.py --output-dir research_runs/ci-demo
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: offline-tests-pandas-${{ matrix.pandas }}
-          path: test-artifacts/
+          name: offline-tests-${{ matrix.os }}-pandas-${{ matrix.pandas }}
+          path: |
+            test-artifacts/
+            research_runs/ci-demo/

@@ -1,0 +1,5 @@
+# Python 3.12; isolated offline tests/demo only. No credentials required.
+numpy==2.3.5
+pandas==2.2.3
+alpaca-py==0.44.0
+tzdata==2026.5

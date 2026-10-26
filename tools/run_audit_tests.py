@@ -17,7 +17,7 @@ import pandas as pd
 BASE = Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(BASE))
 MODULES = ["test_audit_hardening", "test_intraday_replay", "test_pipeline_contract",
-           "test_replay_risk", "test_paper_boundaries", "test_driver_end_to_end", "test_order_lifecycle"]
+           "test_replay_risk", "test_paper_boundaries", "test_driver_end_to_end", "test_order_lifecycle", "test_offline_simulation"]
 
 
 def main():
@@ -33,7 +33,7 @@ def main():
     source_files=sorted(BASE.glob("*.py"))+sorted((BASE/"tools").glob("*.py"))
     report={"tests":result.testsRun,"failures":len(result.failures),"errors":len(result.errors),"skipped":len(result.skipped),
             "successful":result.wasSuccessful(),"modules":MODULES,"network_blocked":True,
-            "alpaca_py":version("alpaca-py"),"python":platform.python_version(),"numpy":np.__version__,"pandas":pd.__version__,
+            "platform":platform.platform(),"alpaca_py":version("alpaca-py"),"python":platform.python_version(),"numpy":np.__version__,"pandas":pd.__version__,
             "source_sha256":{str(p.relative_to(BASE)):hashlib.sha256(p.read_bytes()).hexdigest() for p in source_files}}
     (args.output_dir/"test_results.json").write_text(json.dumps(report,indent=2))
     print(log.getvalue())
