@@ -24,3 +24,7 @@ udo systemctl edit v52-paper-bot.service
 # Isolated research outputs (never replace production models)
 research_runs/
 test-artifacts/
+
+# Local account-bound order state (never commit/delete to bypass a block)
+paper_order_intents.sqlite3*
+paper_order_writer.lock

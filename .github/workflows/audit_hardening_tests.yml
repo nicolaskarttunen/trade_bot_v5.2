@@ -25,9 +25,9 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install offline test dependencies
-        run: python -m pip install numpy==2.3.5 pandas==${{ matrix.pandas }}
+        run: python -m pip install numpy==2.3.5 pandas==${{ matrix.pandas }} alpaca-py==0.44.0
       - name: Syntax check active modules (never import the paper process)
-        run: python -m py_compile ml_models.py features.py model_pipeline.py news_features.py research_validation.py train_models.py backtest_execution.py backtest.py paper_trader_integrated.py intraday_replay.py v6_5_intraday_replay.py
+        run: python -m py_compile ml_models.py features.py model_pipeline.py news_features.py research_validation.py train_models.py backtest_execution.py backtest.py paper_trader_integrated.py intraday_replay.py v6_5_intraday_replay.py order_journal.py order_lifecycle.py paper_order_adapter.py
       - name: Offline regressions with outbound sockets blocked
         run: python tools/run_audit_tests.py --output-dir test-artifacts
       - uses: actions/upload-artifact@v4

@@ -1,5 +1,7 @@
 # Auditoinnin jatko 23.10.2026 — vain kehityshaara
 
+Jatkoa 26.10.: [toimeksiantoloki, osatäytöt ja 96 offline-testiä](ORDER_LIFECYCLE_AUDIT_2026-10-26.md). EOD-massasulku ja todellinen välittäjäintegraatio ovat edelleen käyttöönoton esteitä.
+
 Kohde: `nicolaskarttunen/trade_bot_v5.2`, `audit-hardening-v1`.
 Tarkastuksen lähtöcommit: `f92c46af5c5ee677505b542fe48035d9a82e3047`.
 
