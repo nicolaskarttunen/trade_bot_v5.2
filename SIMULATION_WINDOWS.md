@@ -54,7 +54,7 @@ ja kouluttaa demon mallin muistissa muuttamatta `models/ensemble.pkl`:ää.
 
 ## Mitä tulokset tarkoittavat
 
-Ensimmäinen vaihe ajaa nyt **108 automaattista testiä**, mukaan lukien toimeksiantojen
+Ensimmäinen vaihe ajaa nyt **116 automaattista testiä**, mukaan lukien toimeksiantojen
 kadonneet kuittaukset, restart, osatäytöt ja riskirajat. Nämä käyttävät
 valevälittäjää. Varsinainen OHLC-simulaattori ei mallinna samoja välittäjätapahtumia.
 
@@ -133,5 +133,12 @@ eivät strategiamuutoksia. Vanhaa lokkia ei poisteta tai nollata korjauksena.
 
 Käyttäjän 102 tiedoston SIP-aineistosta löydettyjen viiden aukon erillinen,
 vain hintadataa lukeva tarkistus: [GAP_PROBE_2026-10-26.md](GAP_PROBE_2026-10-26.md).
-Kahdeksan lisätestiä nostavat nykyisen testimäärän 108:aan. Varsinainen
+Tässä vaiheessa kahdeksan lisätestiä nostivat testimäärän 108:aan. Varsinainen
 synteettinen toimintademo ja strategian asetukset eivät muutu.
+
+## Elokuun 2026 historiallinen kehitystesti
+
+Katso [elokuun ajurin ohje](AUGUST_SIMULATION_2026-10-26.md). Se tukee yhtä
+paikallista datahakemistoa ilman syys–lokakuun jatkotiedostoja. Oletusajo
+tarkistaa kattavuuden ja koon; `--run` kouluttaa mallin ja ajaa kaksi kiinteää
+haaraa. Data-aukkoja ei täytetä eikä tätä nimetä riippumattomaksi holdoutiksi.
