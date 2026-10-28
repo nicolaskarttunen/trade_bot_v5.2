@@ -1,0 +1,21 @@
+{
+  "status": "completed",
+  "data_kind": "synthetic",
+  "purpose": "functional_demonstration_only",
+  "symbols": [
+    "NVDA",
+    "AMD"
+  ],
+  "benchmark": "SPY",
+  "sessions": 9,
+  "is_100_stock_test": false,
+  "profitability_validated": false,
+  "broker_access": false,
+  "network_blocked": true,
+  "parameter_search": false,
+  "daily_rows": 18,
+  "trades_by_arm": {
+    "intraday_order_no_gate": 18,
+    "intraday_order_spy_ge010": 0
+  }
+}

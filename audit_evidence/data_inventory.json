@@ -1,0 +1,264 @@
+{
+  "base_commit": "f92c46af5c5ee677505b542fe48035d9a82e3047",
+  "price_files": {
+    "AAPL_5min.csv": {
+      "rows": 72684,
+      "start": "2023-01-03 14:25:00+00:00",
+      "end": "2026-08-31 19:55:00+00:00",
+      "sha256": "26527ebae09662a75e5d7c40e1f212a770e09ac8542477a052cad55b3608cec0",
+      "ohlcv_validation": "passed",
+      "feature_parity_max_abs_diff": 4.440892098500626e-16,
+      "feature_parity_timestamp": "2026-08-31 19:55:00+00:00"
+    },
+    "AMD_5min.csv": {
+      "rows": 72423,
+      "start": "2023-01-03 14:30:00+00:00",
+      "end": "2026-08-31 19:55:00+00:00",
+      "sha256": "c10f72852835b758a006c54c1ae8f3cfc73d8ca2aa11d6d45199c00afbfdd56a",
+      "ohlcv_validation": "passed",
+      "feature_parity_max_abs_diff": 4.440892098500626e-16,
+      "feature_parity_timestamp": "2026-08-31 19:55:00+00:00"
+    },
+    "AMZN_5min.csv": {
+      "rows": 72027,
+      "start": "2023-01-03 14:15:00+00:00",
+      "end": "2026-08-31 19:55:00+00:00",
+      "sha256": "cb0c6d7a2c80d2f4c07360311476b977ae047e96c081053dfc43bd68c1937e83",
+      "ohlcv_validation": "passed",
+      "feature_parity_max_abs_diff": 4.440892098500626e-16,
+      "feature_parity_timestamp": "2026-08-31 19:55:00+00:00"
+    },
+    "META_5min.csv": {
+      "rows": 71642,
+      "start": "2023-01-03 14:25:00+00:00",
+      "end": "2026-08-31 19:55:00+00:00",
+      "sha256": "add5b8e075035a9b8bd20cd36843058ffbc22af8f067fa2f9faac9a15e42c5d7",
+      "ohlcv_validation": "passed",
+      "feature_parity_max_abs_diff": 4.440892098500626e-16,
+      "feature_parity_timestamp": "2026-08-31 19:55:00+00:00"
+    },
+    "MSFT_5min.csv": {
+      "rows": 72145,
+      "start": "2023-01-03 14:30:00+00:00",
+      "end": "2026-08-31 19:55:00+00:00",
+      "sha256": "6fabdc772e010d0773977ad1b92a1206e3c1ee91b094e82292ffb2219d4d8434",
+      "ohlcv_validation": "passed",
+      "feature_parity_max_abs_diff": 4.440892098500626e-16,
+      "feature_parity_timestamp": "2026-08-31 19:55:00+00:00"
+    },
+    "NVDA_5min.csv": {
+      "rows": 75188,
+      "start": "2023-01-03 14:30:00+00:00",
+      "end": "2026-08-31 20:00:00+00:00",
+      "sha256": "c9c4ae0e83d1e83a0bcfa03b547b47e3025ccb0ac2c82f69af1bd20171a3862d",
+      "ohlcv_validation": "passed",
+      "feature_parity_max_abs_diff": 4.440892098500626e-16,
+      "feature_parity_timestamp": "2026-08-31 19:55:00+00:00"
+    },
+    "QQQ_5min.csv": {
+      "rows": 83059,
+      "start": "2023-01-03 13:40:00+00:00",
+      "end": "2026-08-31 20:35:00+00:00",
+      "sha256": "f69a5759d65b886c19748256e02d2500193162cdd530e930e76410be6f6b23f5",
+      "ohlcv_validation": "passed"
+    },
+    "SPY_5min.csv": {
+      "rows": 75779,
+      "start": "2023-01-03 13:35:00+00:00",
+      "end": "2026-08-31 19:55:00+00:00",
+      "sha256": "59a4e730e58eaea44d48f379aed9dfc66d0e190710e7b35fa80038a63f1c4de4",
+      "ohlcv_validation": "passed"
+    },
+    "TSLA_5min.csv": {
+      "rows": 73833,
+      "start": "2023-01-03 14:30:00+00:00",
+      "end": "2026-08-31 20:00:00+00:00",
+      "sha256": "776d5932ced87fb1e626d4511c9e8793826c2267956ba1473296cad0ba61b1c3",
+      "ohlcv_validation": "passed",
+      "feature_parity_max_abs_diff": 4.440892098500626e-16,
+      "feature_parity_timestamp": "2026-08-31 19:55:00+00:00"
+    }
+  },
+  "news_files": {
+    "AAPL_news.csv": {
+      "rows": 13367,
+      "received_at_present": false,
+      "columns": [
+        "timestamp",
+        "symbol",
+        "sentiment",
+        "headline",
+        "source"
+      ],
+      "sha256": "6da0baeed76e2eb1fb7da1f14b28f592aeec9e54b490a9f7ee8cb200e6204a5d"
+    },
+    "AMD_news.csv": {
+      "rows": 5091,
+      "received_at_present": false,
+      "columns": [
+        "timestamp",
+        "symbol",
+        "sentiment",
+        "headline",
+        "source"
+      ],
+      "sha256": "a3201f412ba4d8c6d0a5ec0b1e02792b6da989a3c170b1ffcffb9bdd3efeeda8"
+    },
+    "AMZN_news.csv": {
+      "rows": 11519,
+      "received_at_present": false,
+      "columns": [
+        "timestamp",
+        "symbol",
+        "sentiment",
+        "headline",
+        "source"
+      ],
+      "sha256": "0bf0a9d18cec4c361e4b25a1f42f187ef2ea8635185f5944bbe38406a2cfa22c"
+    },
+    "META_news.csv": {
+      "rows": 10006,
+      "received_at_present": false,
+      "columns": [
+        "timestamp",
+        "symbol",
+        "sentiment",
+        "headline",
+        "source"
+      ],
+      "sha256": "11929400605675b5f95da418d8ad623d7c93c4004a9d7a7fda5887cac440042b"
+    },
+    "MSFT_news.csv": {
+      "rows": 12287,
+      "received_at_present": false,
+      "columns": [
+        "timestamp",
+        "symbol",
+        "sentiment",
+        "headline",
+        "source"
+      ],
+      "sha256": "7fda60c0a90239543b633c4503e656fdad97db0504b7a50c31662e26e6566256"
+    },
+    "NVDA_news.csv": {
+      "rows": 15921,
+      "received_at_present": false,
+      "columns": [
+        "timestamp",
+        "symbol",
+        "sentiment",
+        "headline",
+        "source"
+      ],
+      "sha256": "d57f0090b9017bdd146ad27d8cf4032db68f247369aa686f8cbe33b7070fdb45"
+    },
+    "TSLA_news.csv": {
+      "rows": 17459,
+      "received_at_present": false,
+      "columns": [
+        "timestamp",
+        "symbol",
+        "sentiment",
+        "headline",
+        "source"
+      ],
+      "sha256": "baed72688f8c78e8e0b516cc609d948f7cebe82b4fb06048ad498c1f5239efd0"
+    }
+  },
+  "missing_config_symbols": [
+    "AVGO",
+    "ORCL",
+    "CRM",
+    "ADBE",
+    "QCOM",
+    "INTC",
+    "AMAT",
+    "MU",
+    "LRCX",
+    "TXN",
+    "CSCO",
+    "GOOGL",
+    "GOOG",
+    "NFLX",
+    "DIS",
+    "T",
+    "VZ",
+    "CMCSA",
+    "TMUS",
+    "CHTR",
+    "HD",
+    "LOW",
+    "MCD",
+    "NKE",
+    "TJX",
+    "BKNG",
+    "SBUX",
+    "GM",
+    "WMT",
+    "COST",
+    "PG",
+    "KO",
+    "PEP",
+    "PM",
+    "MO",
+    "CL",
+    "MDLZ",
+    "KHC",
+    "JPM",
+    "BAC",
+    "WFC",
+    "C",
+    "GS",
+    "MS",
+    "BLK",
+    "SCHW",
+    "AXP",
+    "USB",
+    "LLY",
+    "UNH",
+    "JNJ",
+    "ABBV",
+    "MRK",
+    "PFE",
+    "TMO",
+    "ABT",
+    "ISRG",
+    "AMGN",
+    "XOM",
+    "CVX",
+    "COP",
+    "SLB",
+    "EOG",
+    "OXY",
+    "MPC",
+    "PSX",
+    "VLO",
+    "HAL",
+    "CAT",
+    "DE",
+    "GE",
+    "HON",
+    "RTX",
+    "UNP",
+    "UPS",
+    "BA",
+    "ETN",
+    "LMT",
+    "LIN",
+    "SHW",
+    "FCX",
+    "NEM",
+    "NUE",
+    "NEE",
+    "DUK",
+    "SO",
+    "AEP",
+    "EXC",
+    "PLD",
+    "AMT",
+    "O",
+    "CCI",
+    "EQIX"
+  ],
+  "profitability_run": false
+}
