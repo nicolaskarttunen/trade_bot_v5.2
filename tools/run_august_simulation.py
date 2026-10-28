@@ -8,10 +8,18 @@ from contextlib import ExitStack
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import socket
+import shutil
 import sys
 from unittest.mock import patch
+
+# Bound worker stacks and avoid BLAS thread startup per small disk block.
+# These variables affect only this CLI process and its children.
+if "--low-memory" in sys.argv:
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["OMP_NUM_THREADS"] = "1"
 
 import numpy as np
 import pandas as pd
@@ -23,6 +31,7 @@ from features import FEATURES, enrich, label, normalize_bars
 from model_pipeline import fit_bundle, predict_bundle, trade_score, training_rows
 from intraday_replay import replay_intraday, as_day_clock
 from research_validation import input_manifest, build_spy_gate, paired_daily_comparison
+from disk_training import TrainingStore, fit_disk_bundle, RECORD, BLOCK_ROWS
 
 WINDOW = ("2023-01-01", "2026-07-31", "2026-08-01", "2026-08-31")
 CALENDAR = BASE / "research_calendars/nyse_2026_08.csv"
@@ -101,7 +110,34 @@ def prepare(frame, market, cfg):
     return train, test
 
 
-def run(data_dir, output_dir, execute=False):
+def replay_by_session(scored, prices, symbols, sectors, cfg, *, spy_opening_gate,
+                      require_spy, session_closes):
+    """Same engine, one flat-to-flat session at a time; carry actual cash."""
+    cash = float(cfg["initial_cash"])
+    trades, daily, curves = [], [], []
+    for day in sorted(session_closes):
+        start = pd.Timestamp(day, tz=NY)
+        end = start + pd.DateOffset(days=1)
+        def select(frames):
+            return {s: x.loc[(x.timestamp >= start) & (x.timestamp < end)].copy()
+                    for s, x in frames.items()}
+        cash, t, d, c = replay_intraday(
+            select(scored), select(prices), symbols, sectors,
+            dict(cfg, initial_cash=cash), spy_opening_gate=spy_opening_gate,
+            require_spy=require_spy, session_closes={day: session_closes[day]})
+        if len(d) != 1 or str(d.iloc[0]["date"]) != day:
+            raise ValueError(f"Missing replay session {day}")
+        if not t.empty:
+            trades.append(t)
+        daily.append(d)
+        if not c.empty:
+            curves.append(c)
+    def combine(frames):
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return cash, combine(trades), combine(daily), combine(curves)
+
+
+def run(data_dir, output_dir, execute=False, low_memory=False):
     data_dir, output_dir = Path(data_dir).resolve(), Path(output_dir).resolve()
     if output_dir == data_dir or data_dir in output_dir.parents:
         raise ValueError("Output must be outside original data directory")
@@ -123,7 +159,8 @@ def run(data_dir, output_dir, execute=False):
               "network_blocked": True, "broker_access": False, "news_mode": "neutral",
               "OPG_included": False, "parameter_search": False, "strict_price_coverage": True,
               "windows": [WINDOW], "symbols": symbols, "benchmark": bench,
-              "sessions": len(sessions), "coverage": [], "input_sha256": {}}
+              "sessions": len(sessions), "coverage": [], "input_sha256": {},
+              "low_memory": low_memory, "training_block_rows": BLOCK_ROWS if low_memory else None}
     report_path = output_dir / "run_report.json"
     write_json(report_path, report)
     try:
@@ -149,34 +186,60 @@ def run(data_dir, output_dir, execute=False):
             manifest["input_sha256"] = dict(report["input_sha256"])
             manifest["input_sha256"][str(CALENDAR)] = digest(CALENDAR)
             manifest["source_sha256"]["tools/run_august_simulation.py"] = digest(Path(__file__))
+            manifest["source_sha256"]["disk_training.py"] = digest(BASE / "disk_training.py")
             manifest.update(classification=report["classification"], feed_assumption="sip",
-                            full_feed_adjustment_provenance_verified=False, status="inputs_checked")
+                            full_feed_adjustment_provenance_verified=False, status="inputs_checked",
+                            low_memory=low_memory)
             write_json(output_dir / "manifest.json", manifest)
             write_json(report_path, report)
             print(f"Raw training rows (upper bound): {report['raw_training_rows_upper_bound']:,}", flush=True)
             print(f"One feature matrix upper bound: {report['single_feature_matrix_gib_upper_bound']:.2f} GiB; peak RAM is larger", flush=True)
             if execute:
+                if low_memory:
+                    # Conservative allocation allowance: shards + merged data +
+                    # standardized cache, plus headroom. Never delete user inputs.
+                    required = report["raw_training_rows_upper_bound"]*RECORD.itemsize*3 + 1024**3
+                    available = shutil.disk_usage(output_dir).free
+                    report["required_free_disk_bytes"] = required
+                    if available < required:
+                        raise ValueError(f"Low-memory run needs {required/1024**3:.1f} GiB free disk; available {available/1024**3:.1f} GiB")
+                    print("Low-memory mode: disk training, full-batch updates, daily replay. No rows or models removed.", flush=True)
                 report["status"] = "preparing_features"
                 write_json(report_path, report)
                 market, _ = read_source(paths[bench], report["input_sha256"][str(paths[bench])])
                 gate = build_spy_gate(market)
                 train_parts, test_frames, prices = [], {}, {}
+                store = TrainingStore(output_dir / "training_cache") if low_memory else None
                 for i, symbol in enumerate(symbols, 1):
                     raw, _ = read_source(paths[symbol], report["input_sha256"][str(paths[symbol])])
                     train_s, test_s = prepare(raw, market, cfg)
-                    train_parts.append(train_s)
+                    if low_memory:
+                        store.append(train_s)
+                    else:
+                        train_parts.append(train_s)
                     test_frames[symbol] = test_s
                     prices[symbol] = raw.loc[raw.timestamp >= CUTOFF, OHLCV].copy()
                     print(f"Features {i}/{len(symbols)} {symbol}: train={len(train_s):,}, test={len(test_s):,}", flush=True)
-                train = pd.concat(train_parts, ignore_index=True).sort_values("timestamp", kind="stable")
-                train_parts.clear()
+                if low_memory:
+                    print("Merging training shards in stable timestamp order on disk...", flush=True)
+                    store.finish()
+                    rows, last = store.rows, pd.Timestamp(store.last_timestamp, tz="UTC")
+                else:
+                    train = pd.concat(train_parts, ignore_index=True).sort_values("timestamp", kind="stable")
+                    train_parts.clear()
+                    rows, last = len(train), train.timestamp.max()
                 del train_s, raw
-                report.update(status="training", training_rows=len(train),
-                              training_last_bar=str(train.timestamp.max()))
+                report.update(status="training", training_rows=rows,
+                              training_last_bar=str(last))
                 write_json(report_path, report)
                 print("Training fixed ensemble; this can take a long time. No parameter search.", flush=True)
-                bundle = fit_bundle(train, cfg, "neutral", metadata={"windows": [WINDOW]})
-                del train
+                if low_memory:
+                    bundle = fit_disk_bundle(store, cfg, "neutral", metadata={"windows": [WINDOW]})
+                    report["training_cache_sha256"] = digest(store.path)
+                    report["training_cache_directory_removed"] = store.cleanup()
+                else:
+                    bundle = fit_bundle(train, cfg, "neutral", metadata={"windows": [WINDOW]})
+                    del train
                 scored = {}
                 for symbol, test_s in test_frames.items():
                     x = test_s[["timestamp", "signal_available_at", "atr", "news_score"]].copy()
@@ -189,7 +252,8 @@ def run(data_dir, output_dir, execute=False):
                     report.update(status="replaying", active_arm=strategy["name"])
                     write_json(report_path, report)
                     print(f"Replaying {strategy['name']}", flush=True)
-                    cash, trades, daily, curve = replay_intraday(
+                    replay = replay_by_session if low_memory else replay_intraday
+                    cash, trades, daily, curve = replay(
                         scored, prices, symbols, reference.SECTOR_BY_SYMBOL, cfg,
                         spy_opening_gate=gate, require_spy=strategy["spy_gate"], session_closes=sessions)
                     if set(daily.date) != set(sessions) or len(daily) != len(sessions):
@@ -238,10 +302,11 @@ def main():
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--run", action="store_true", help="Train/replay after input checks; default only validates")
+    parser.add_argument("--low-memory", action="store_true", help="Use disk-backed full-batch training and per-session replay")
     args = parser.parse_args()
     print("AUGUST 2026 DEVELOPMENT CHECK / REPLAY; no credentials, orders or production changes.", flush=True)
     try:
-        run(args.data_dir, args.output_dir, args.run)
+        run(args.data_dir, args.output_dir, args.run, args.low_memory)
     except Exception as exc:
         raise SystemExit(f"Stopped ({type(exc).__name__}): {exc}. No validated result.")
 

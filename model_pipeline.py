@@ -42,13 +42,18 @@ def training_rows(frame, start, cutoff):
     return frame.loc[valid].copy()
 
 
+def make_models():
+    """One fixed definition for RAM and disk-backed full-batch trainers."""
+    return [LogisticGD(lr=.03, epochs=500, l2=.01),
+            RandomLinearEnsemble(n_models=25, seed=42), CentroidClassifier()]
+
+
 def fit_bundle(train, cfg, news_mode, metadata=None):
     X = train[FEATURES].to_numpy(dtype=float)
     y = train["target"].to_numpy(dtype=float)
     if len(train) == 0 or not np.isfinite(X).all() or not np.isfinite(y).all() or set(np.unique(y)) != {0, 1}:
         raise ValueError("Training requires finite features and both binary classes")
-    models = [LogisticGD(lr=.03, epochs=500, l2=.01),
-              RandomLinearEnsemble(n_models=25, seed=42), CentroidClassifier()]
+    models = make_models()
     for model in models:
         model.fit(X, y.astype(int))
     return {"models": models, "features": list(FEATURES),

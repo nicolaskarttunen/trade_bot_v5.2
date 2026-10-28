@@ -132,3 +132,9 @@ sessioita. Kuukauden normaalit arkipäivät on tallennettu tiedostoon
 - https://www.nyse.com/markets/hours-calendars
 - https://www.nyse.com/publicdocs/nyse/ICE_NYSE_2026_Yearly_Trading_Calendar.pdf
 - https://ir.theice.com/press/news-details/2024/NYSE-Group-Announces-2025-2026-and-2027-Holiday-and-Early-Closings-Calendar/default.aspx
+
+## Lisays 28.10.2026: vahamuistinen ajotapa
+
+Jos RAM on niukka, kayta erillista `--low-memory`-valitsinta.
+[Toteutus ja sen erilliset testitulokset](LOW_MEMORY_2026-10-28.md).
+Alkuperainen RAM-ajotapa ja kokeen parametrit sailyvat ennallaan.

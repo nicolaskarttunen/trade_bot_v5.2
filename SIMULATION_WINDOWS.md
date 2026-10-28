@@ -54,7 +54,7 @@ ja kouluttaa demon mallin muistissa muuttamatta `models/ensemble.pkl`:ää.
 
 ## Mitä tulokset tarkoittavat
 
-Ensimmäinen vaihe ajaa nyt **116 automaattista testiä**, mukaan lukien toimeksiantojen
+Ensimmäinen vaihe ajaa nyt **126 automaattista testiä**, mukaan lukien toimeksiantojen
 kadonneet kuittaukset, restart, osatäytöt ja riskirajat. Nämä käyttävät
 valevälittäjää. Varsinainen OHLC-simulaattori ei mallinna samoja välittäjätapahtumia.
 
@@ -142,3 +142,9 @@ Katso [elokuun ajurin ohje](AUGUST_SIMULATION_2026-10-26.md). Se tukee yhtä
 paikallista datahakemistoa ilman syys–lokakuun jatkotiedostoja. Oletusajo
 tarkistaa kattavuuden ja koon; `--run` kouluttaa mallin ja ajaa kaksi kiinteää
 haaraa. Data-aukkoja ei täytetä eikä tätä nimetä riippumattomaksi holdoutiksi.
+
+## Vahennetty muistinkulutus
+
+Elokuun ajurissa on nyt erillinen `--low-memory`-valitsin.
+Katso [toteutus, testirajat ja ajokomento](LOW_MEMORY_2026-10-28.md).
+Koko aineisto ja samat mallit sailytetaan, koulutus toimii levylohkoissa.

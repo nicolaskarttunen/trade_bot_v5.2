@@ -19,10 +19,12 @@ class LogisticGD:
 
 class RandomLinearEnsemble:
     def __init__(self,n_models=25,seed=42): self.n_models=n_models; self.seed=seed
+    @staticmethod
+    def make_member(): return LogisticGD(lr=0.02,epochs=250,l2=0.03)
     def fit(self,X,y):
         X=np.asarray(X,dtype=float); y=np.asarray(y,dtype=float); rng=np.random.default_rng(self.seed); self.models_=[]
         for i in range(self.n_models):
-            idx=rng.integers(0,len(y),len(y)); cols=rng.choice(X.shape[1],size=max(4,X.shape[1]//2),replace=False); m=LogisticGD(lr=0.02,epochs=250,l2=0.03); m.fit(X[idx][:,cols],y[idx]); self.models_.append((cols,m))
+            idx=rng.integers(0,len(y),len(y)); cols=rng.choice(X.shape[1],size=max(4,X.shape[1]//2),replace=False); m=self.make_member(); m.fit(X[idx][:,cols],y[idx]); self.models_.append((cols,m))
         return self
     def predict_proba(self,X):
         probs=[m.predict_proba(np.asarray(X)[:,cols])[:,1] for cols,m in self.models_]; p=np.mean(probs,axis=0); return np.column_stack([1-p,p])
