@@ -47,3 +47,5 @@ Lähde: käyttäjän PowerShell-tuloste, ajo `jarjestys-20261109-130806`, tila `
 | +0,10 % | Päivittäin vaihtuva | 20 | 40 % | 40 % | +0,144 % | −0,433 % |
 
 Muuttunut järjestys vähensi listan alkupään ja teknologiasektorin osuutta toteutuneiden kauppojen lukumäärästä. Osuudet eivät mittaa pääomapainoja. Ilman porttia 52/100 kauppaa kohdistui edelleen teknologiasektoriin. SPY-portti salli kaupankäynnin vain neljänä päivänä; sen haaran 20 kauppaa eivät ole 20 riippumatonta päivähavaintoa. Molemmissa haaroissa myös arvonlasku ja tuotto pienenivät. Järjestys säilyy kokeellisena, oletusasetuksia ei vaihdeta. Mahdollinen seuraava vahvistus tehdään ennalta lukitulla, aiemmin tarkastelemattomalla jaksolla ilman elokuuhun perustuvaa säätöä.
+
+Seuraavan ennalta lukitun historiallisen jakson [protokolla ja ajokomento](LOCKED_PERIOD.md).
