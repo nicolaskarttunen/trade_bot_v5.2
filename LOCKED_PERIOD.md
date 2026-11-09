@@ -53,3 +53,5 @@ Lähde: saman ajon käyttäjän toimittama report.json-ote. SPY-portti salli kau
 | Vaihtuva vs. alkuperäinen järjestys, portilla | +3,22 | −6,34 … +14,21 | 2/14 |
 
 Kaikki neljä väliä sisältävät nollan. Arviot kuvaavat 14 istunnon jaksoa (5 päivän lohkot, 2 000 uudelleenotantaa, siemen 20261023). Uudelleenotannat eivät lisää havaittujen päivien määrää. Nämä välit koskevat päivätuottoeroa, eivät suurimman arvonlaskun eroa. Raportin independent_evidence on false kaikissa vertailuissa. Oletusasetukset säilyvät ennallaan.
+
+Seuraava koe: [neljän vertailuversion seuranta tulevina päivinä](FORWARD_SIMULATION.md).

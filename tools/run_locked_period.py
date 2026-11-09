@@ -44,9 +44,11 @@ PARAMS = dict(feed="sip", adjustment="raw", timeframe="5Min", asof="2026-08-31",
               end=(END-pd.Timedelta(seconds=1)).tz_convert("UTC").isoformat())
 
 
-def fetch_bars(symbol, headers):
+def fetch_bars(symbol, headers, *, start=None, end=None):
     """GET historical bars only. Never pass credentials through redirects or logs."""
     params = dict(PARAMS)
+    if start is not None and end is not None:
+        params.update(start=start.isoformat(), end=end.isoformat())
     bars, seen = [], set()
     for _ in range(32):
         with requests.get(f"https://data.alpaca.markets/v2/stocks/{symbol}/bars",
@@ -93,17 +95,77 @@ def read_extension(path, symbol, benchmark):
     return frame,hashlib.sha256(raw).hexdigest(),[t.isoformat() for t in missing]
 
 
-def score(frame, market, cfg, bundle):
+def score(frame, market, cfg, bundle, start=START, end=END):
     # Inference never calls label() or reads targets.
     x=enrich(frame,market,news=None,news_decay_minutes=cfg["news_decay_minutes"],
              news_lookback_minutes=cfg["news_lookback_minutes"])
-    x=x.loc[(x.timestamp>=START)&(x.timestamp<END)].copy()
+    x=x.loc[(x.timestamp>=start)&(x.timestamp<end)].copy()
     x=x.loc[np.isfinite(x[[*FEATURES,"atr"]].to_numpy(dtype=float)).all(axis=1)]
     if x.empty:
         raise ValueError("No usable evaluation features")
     p=predict_bundle(bundle,x,cfg)
     return x[["timestamp","signal_available_at","atr","news_score"]].assign(
         ml_prob=p,trade_score=trade_score(p,x.market_ret_3,x.news_score,cfg))
+
+
+def training_reference(train_data,reference,out,symbols,bench,cfg,report):
+    paths={s:train_data/f"{s}_5min.csv" for s in [*symbols,bench]}
+    missing=[p.name for p in paths.values() if not p.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Missing {len(missing)}/{len(paths)} training inputs; first: {missing[:3]}")
+    manifest_path=reference/"manifest.json"
+    mbytes=manifest_path.read_bytes(); manifest=json.loads(mbytes)
+    ref_hash=hashlib.sha256(mbytes).hexdigest()
+    ref_report_path=reference/"run_report.json"
+    rbytes=ref_report_path.read_bytes(); ref=json.loads(rbytes)
+    if (manifest.get("config")!=cfg or manifest.get("windows")!=[list(aug.WINDOW)] or
+        manifest.get("status")!="completed_development_comparison" or ref.get("low_memory") is not True
+        or ref.get("status")!="completed_development_comparison" or ref.get("source_hashes_unchanged_at_end") is not True
+        or manifest["outputs"].get("run_report.json")!=hashlib.sha256(rbytes).hexdigest()
+        or manifest["outputs"].get(CACHE)!=aug.digest(reference/CACHE)):
+        raise ValueError("Need the verified reference subfolder of the completed August order trial")
+    for name in ["features.py","model_pipeline.py","ml_models.py","news_features.py","disk_training.py"]:
+        if manifest["source_sha256"].get(name)!=report["source_sha256"][name]:
+            raise ValueError(f"Reference training source differs: {name}")
+    expected={PureWindowsPath(k).name:v for k,v in ref["input_sha256"].items()}
+    if set(expected)!={p.name for p in paths.values()} or any(aug.digest(p)!=expected[p.name] for p in paths.values()):
+        raise ValueError("Training history differs from the verified August run")
+    report.update(reference_manifest_sha256=ref_hash,training_sources=expected)
+    required=int(ref["raw_training_rows_upper_bound"])*RECORD.itemsize*3+1024**3
+    if shutil.disk_usage(out).free<required:
+        raise ValueError(f"Need at least {required/1024**3:.1f} GiB free")
+    return paths,expected,manifest,ref,ref_hash
+
+
+def rebuild(reference,out,symbols,bench,cfg,paths,expected,ref,report,save):
+    market,_=aug.read_source(paths[bench],expected[paths[bench].name])
+    store=TrainingStore(out/"training_cache"); samples={}
+    with zipfile.ZipFile(reference/CACHE) as old_cache:
+        for i,s in enumerate(symbols):
+            hist,_=aug.read_source(paths[s],expected[paths[s].name])
+            train,test=aug.prepare(hist,market,cfg)
+            store.append(train)
+            with old_cache.open(f"{i}/scores.csv") as f:
+                saved=pd.read_csv(f,usecols=["timestamp","ml_prob"],float_precision="round_trip")
+            anchors=saved.iloc[sorted(set([0,len(saved)//2,len(saved)-1]))].copy()
+            anchors["timestamp"]=pd.to_datetime(anchors.timestamp,utc=True)
+            sample=anchors.merge(test[["timestamp",*FEATURES]],on="timestamp",validate="one_to_one")
+            if len(sample)!=len(anchors): raise ValueError(f"{s}: missing August model anchors")
+            samples[s]=sample
+            print(f"Prepared training history {i+1}/{len(symbols)} {s}",flush=True)
+    del train,test,hist,market
+    store.finish()
+    if store.rows!=ref["training_rows"] or aug.digest(store.path)!=ref["training_cache_sha256"]:
+        raise ValueError("Training matrix differs from August reference")
+    report.update(status="training",training_rows=store.rows,training_cache_sha256=ref["training_cache_sha256"])
+    save()
+    bundle=fit_disk_bundle(store,cfg,"neutral")
+    for s,x in samples.items():
+        if not np.allclose(predict_bundle(bundle,x,cfg),x.ml_prob,rtol=0,atol=1e-10):
+            raise ValueError(f"{s}: reconstructed model differs at August anchors")
+    report["august_anchor_predictions_checked"]=sum(map(len,samples.values()))
+    report["training_cache_removed"]=store.cleanup()
+    return bundle
 
 
 def run(train_data, reference, out, extension=None, env_file=None):
@@ -131,31 +193,8 @@ def run(train_data, reference, out, extension=None, env_file=None):
     def save(): aug.write_json(report_file,report)
     save()
     try:
-        paths={s:train_data/f"{s}_5min.csv" for s in [*symbols,bench]}
-        missing=[p.name for p in paths.values() if not p.is_file()]
-        if missing:
-            raise FileNotFoundError(f"Missing {len(missing)}/{len(paths)} training inputs; first: {missing[:3]}")
-        manifest_path=reference/"manifest.json"
-        mbytes=manifest_path.read_bytes(); manifest=json.loads(mbytes)
-        ref_hash=hashlib.sha256(mbytes).hexdigest()
-        ref_report_path=reference/"run_report.json"
-        rbytes=ref_report_path.read_bytes(); ref=json.loads(rbytes)
-        if (manifest.get("config")!=cfg or manifest.get("windows")!=[list(aug.WINDOW)] or
-            manifest.get("status")!="completed_development_comparison" or ref.get("low_memory") is not True
-            or ref.get("status")!="completed_development_comparison" or ref.get("source_hashes_unchanged_at_end") is not True
-            or manifest["outputs"].get("run_report.json")!=hashlib.sha256(rbytes).hexdigest()
-            or manifest["outputs"].get(CACHE)!=aug.digest(reference/CACHE)):
-            raise ValueError("Need the verified reference subfolder of the completed August order trial")
-        for name in ["features.py","model_pipeline.py","ml_models.py","news_features.py","disk_training.py"]:
-            if manifest["source_sha256"].get(name)!=report["source_sha256"][name]:
-                raise ValueError(f"Reference training source differs: {name}")
-        expected={PureWindowsPath(k).name:v for k,v in ref["input_sha256"].items()}
-        if set(expected)!={p.name for p in paths.values()} or any(aug.digest(p)!=expected[p.name] for p in paths.values()):
-            raise ValueError("Training history differs from the verified August run")
-        report.update(reference_manifest_sha256=ref_hash,training_sources=expected)
-        required=int(ref["raw_training_rows_upper_bound"])*RECORD.itemsize*3+1024**3
-        if shutil.disk_usage(out).free<required:
-            raise ValueError(f"Need at least {required/1024**3:.1f} GiB free")
+        paths,expected,manifest,ref,ref_hash=training_reference(train_data,reference,out,symbols,bench,cfg,report)
+        manifest_path,ref_report_path=reference/"manifest.json",reference/"run_report.json"
         if env_file:
             from dotenv import dotenv_values
             if not Path(env_file).is_file(): raise ValueError("Historical-data credentials file not found")
@@ -177,33 +216,7 @@ def run(train_data, reference, out, extension=None, env_file=None):
                 _,ext_hash[s],gaps[s]=read_extension(path,s,bench)
             report.update(status="validated_inputs",extension_sha256=ext_hash,missing_regular_bars=gaps)
             save()
-            market,_=aug.read_source(paths[bench],expected[paths[bench].name])
-            store=TrainingStore(out/"training_cache"); samples={}
-            with zipfile.ZipFile(reference/CACHE) as old_cache:
-                for i,s in enumerate(symbols):
-                    hist,_=aug.read_source(paths[s],expected[paths[s].name])
-                    train,test=aug.prepare(hist,market,cfg)
-                    store.append(train)
-                    with old_cache.open(f"{i}/scores.csv") as f:
-                        saved=pd.read_csv(f,usecols=["timestamp","ml_prob"],float_precision="round_trip")
-                    anchors=saved.iloc[sorted(set([0,len(saved)//2,len(saved)-1]))].copy()
-                    anchors["timestamp"]=pd.to_datetime(anchors.timestamp,utc=True)
-                    sample=anchors.merge(test[["timestamp",*FEATURES]],on="timestamp",validate="one_to_one")
-                    if len(sample)!=len(anchors): raise ValueError(f"{s}: missing August model anchors")
-                    samples[s]=sample
-                    print(f"Prepared training history {i+1}/{len(symbols)} {s}",flush=True)
-            del train,test,hist,market
-            store.finish()
-            if store.rows!=ref["training_rows"] or aug.digest(store.path)!=ref["training_cache_sha256"]:
-                raise ValueError("Training matrix differs from August reference")
-            report.update(status="training",training_rows=store.rows,training_cache_sha256=ref["training_cache_sha256"])
-            save()
-            bundle=fit_disk_bundle(store,cfg,"neutral")
-            for s,x in samples.items():
-                if not np.allclose(predict_bundle(bundle,x,cfg),x.ml_prob,rtol=0,atol=1e-10):
-                    raise ValueError(f"{s}: reconstructed model differs at August anchors")
-            report["august_anchor_predictions_checked"]=sum(map(len,samples.values()))
-            report["training_cache_removed"]=store.cleanup()
+            bundle=rebuild(reference,out,symbols,bench,cfg,paths,expected,ref,report,save)
             report["status"]="replaying"; save()
             def verified(s):
                 x,h,_=read_extension(ext_paths[s],s,bench)
