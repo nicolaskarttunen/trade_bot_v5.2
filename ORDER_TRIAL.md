@@ -31,6 +31,19 @@ Koetulokset eivät muuta `config.json`-tiedostoa, mallipainoja, Oracle-palvelint
 
 ## Testinäyttö
 
-Synteettiset testit tarkistavat lukitun järjestyksen, listan alkuperäisten paikkojen säilymisen, päivärajan sitoman ensimmäisen valinnan sekä tarkkojen liukulukujen säilymisen CSV-välimuistissa. Integraatiotesti ajaa koko elokuun kahdella keinotekoisella osakkeella: vanha ajomuoto, yksi uusi koulutus, uusi järjestys, seuraava ajo ilman koulutusta sekä hylkäys lähteen tai vertailutuloksen poiketessa. Koko testisarjan ajolokit: [Linux, molemmat pandas-versiot](audit_evidence/2026-11-09-order-trial). Oikean 100 osakkeen järjestyskokeen tulos syntyy vasta käyttäjän paikallisessa ajossa.
+Synteettiset testit tarkistavat lukitun järjestyksen, listan alkuperäisten paikkojen säilymisen, päivärajan sitoman ensimmäisen valinnan sekä tarkkojen liukulukujen säilymisen CSV-välimuistissa. Integraatiotesti ajaa koko elokuun kahdella keinotekoisella osakkeella: vanha ajomuoto, yksi uusi koulutus, uusi järjestys, seuraava ajo ilman koulutusta sekä hylkäys lähteen tai vertailutuloksen poiketessa. Koko testisarjan ajolokit: [Linux, molemmat pandas-versiot](audit_evidence/2026-11-09-order-trial). Paikallisen historiallisen ajon tulokset on kirjattu alle erikseen.
 
 9.11.2026: koko offline-sarja läpäisi 141/141 testiä Linuxissa sekä pandas 2.2.3:lla että 3.0.0:lla, ei ohitettuja testejä. Tämä ei ole käyttäjän historiallinen tuottotulos.
+
+## Paikallinen historiallinen ajo 9.11.2026
+
+Lähde: käyttäjän PowerShell-tuloste, ajo `jarjestys-20261109-130806`, tila `completed_order_experiment_development_only`. Jakso: elokuun 2026 kaikki 21 istuntoa, 100 osakkeen valikoima. Alkuperäisen järjestyksen vertailu toistui ajurin toleransseissa. Alla olevat luvut perustuvat ajurin yhteenvetoon ja kauppalokin sektorilaskentaan; koko paikallista aineistoa ei kopioitu repositorioon.
+
+| SPY-portti | Järjestys | Kauppoja | Teknologiakauppoja | Alkuperäisen listan 20 ensimmäistä | Tuotto | Suurin arvonlasku |
+|---|---|---:|---:|---:|---:|---:|
+| Ei | Alkuperäinen | 100 | 89 % | 89 % | +0,431 % | −2,160 % |
+| Ei | Päivittäin vaihtuva | 100 | 52 % | 56 % | +0,194 % | −1,297 % |
+| +0,10 % | Alkuperäinen | 20 | 100 % | 100 % | +0,287 % | −0,752 % |
+| +0,10 % | Päivittäin vaihtuva | 20 | 40 % | 40 % | +0,144 % | −0,433 % |
+
+Muuttunut järjestys vähensi listan alkupään ja teknologiasektorin osuutta toteutuneiden kauppojen lukumäärästä. Osuudet eivät mittaa pääomapainoja. Ilman porttia 52/100 kauppaa kohdistui edelleen teknologiasektoriin. SPY-portti salli kaupankäynnin vain neljänä päivänä; sen haaran 20 kauppaa eivät ole 20 riippumatonta päivähavaintoa. Molemmissa haaroissa myös arvonlasku ja tuotto pienenivät. Järjestys säilyy kokeellisena, oletusasetuksia ei vaihdeta. Mahdollinen seuraava vahvistus tehdään ennalta lukitulla, aiemmin tarkastelemattomalla jaksolla ilman elokuuhun perustuvaa säätöä.
