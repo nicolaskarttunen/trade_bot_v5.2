@@ -150,3 +150,5 @@ Katso [toteutus, testirajat ja ajokomento](LOW_MEMORY_2026-10-28.md).
 Koko aineisto ja samat mallit sailytetaan, koulutus toimii levylohkoissa.
 
 Valmiin elokuun ajon voi tarkistaa ilman uutta koulutusta: [kauppalokin tarkistus](LEDGER_AUDIT.md).
+
+Nykyisen ja päivittäin vaihtuvan osakejärjestyksen erillinen vertailu: [yksi PowerShell-ajo ja tulosten tulkinta](ORDER_TRIAL.md).

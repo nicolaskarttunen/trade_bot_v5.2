@@ -33,6 +33,7 @@ from intraday_replay import replay_intraday, as_day_clock
 from research_validation import input_manifest, build_spy_gate, paired_daily_comparison
 from disk_training import TrainingStore, fit_disk_bundle, RECORD, BLOCK_ROWS
 from replay_audit import audit_frames
+from order_trial import CACHE, save_cache
 
 WINDOW = ("2023-01-01", "2026-07-31", "2026-08-01", "2026-08-31")
 CALENDAR = BASE / "research_calendars/nyse_2026_08.csv"
@@ -139,7 +140,7 @@ def replay_by_session(scored, prices, symbols, sectors, cfg, *, spy_opening_gate
     return cash, combine(trades), combine(daily), combine(curves)
 
 
-def run(data_dir, output_dir, execute=False, low_memory=False):
+def run(data_dir, output_dir, execute=False, low_memory=False, retain_replay_inputs=False):
     data_dir, output_dir = Path(data_dir).resolve(), Path(output_dir).resolve()
     if output_dir == data_dir or data_dir in output_dir.parents:
         raise ValueError("Output must be outside original data directory")
@@ -289,6 +290,9 @@ def run(data_dir, output_dir, execute=False, low_memory=False):
                 comparison.update(classification="august_development_only", independent_evidence=False)
                 comparison["gate_allowed_sessions"] = sum(bool(gate[d]) for d in sessions)
                 write_json(output_dir / "spy_comparison.json", comparison)
+                if retain_replay_inputs:
+                    save_cache(output_dir / CACHE, symbols, scored, prices, gate, sessions)
+                    manifest["source_sha256"]["order_trial.py"] = digest(BASE / "order_trial.py")
                 manifest["feature_contract"] = bundle["feature_contract"]
                 report["status"] = "completed_development_comparison"
             else:
