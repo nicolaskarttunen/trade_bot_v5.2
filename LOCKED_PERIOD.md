@@ -27,3 +27,16 @@ Aja pöytäkoneen nykyisessä kehityshaaran simulaatiokansiossa:
 Jos haku pysähtyy, tarkista virheilmoitus (esim. HTTP 403 tarkoittaa, ettei kyseinen historiapyyntö onnistunut). Ei vaihtoa IEX-syötteeseen eikä osakkeiden poistoa onnistuneen tuloksen saamiseksi. Jos kaikki CSV:t jo haettiin, niitä voi käyttää uudessa tuloskansiossa --extension-dir-valitsimella; julkaise alkuperäisen pyynnön lähde- ja tiivistetiedot arviointia varten.
 
 Testattu pienellä synteettisellä aineistolla: oikea koulutus, kaikki neljä haaraa, kaikki 14 istuntoa ja kesä-/talviajan raja, aiemman mallin ennusteankkurit, puuttuva SPY-kynttilä ja istunto, lämpenemishistoria, muuttunut koulutusdata, paikallisten tulosten ylikirjoitussuoja sekä historialukijan sivutus/HTTP-virheet ilman verkkoyhteyttä. [Offline-testien lokit](audit_evidence/2026-11-09-locked-period). Kehitysympäristön historiallisen ajon yrityksestä puuttui 93/101 vaaditusta koulutustiedostosta. Koko hintahistorian ajo ja oikea API-haku tältä jaksolta eivät ole osa tätä testinäyttöä.
+
+## Pöytäkoneen historiallinen ajo
+
+Käyttäjän lähettämä konsoliyhteenveto, `lukittu-20261109-151005`, tila `completed_fixed_period_comparison`. Aiemmin sovitut neljä vaihtoehtoa, 20.10.–6.11.2026, 14 istuntoa. Nämä luvut ovat simuloituja tuloksia; koko paikallista report.json-tiedostoa tai päivä- ja kauppalokia ei ole tässä tarkastettu itsenäisesti.
+
+| Järjestys | SPY-portti | Tuotto (%) | Kaupat | Voitto-osuus (%) | Profit factor | Suurin arvonlasku (%) | Keskimääräinen P&L |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Alkuperäinen | Ei | 0,503251 | 69 | 46,376812 | 1,107118 | −1,586056 | 7,293494 |
+| Alkuperäinen | ≥ +0,10 % | 0,523348 | 15 | 53,333333 | 1,698130 | −0,449953 | 34,889880 |
+| Päivittäin vaihtuva | Ei | 1,202146 | 69 | 49,275362 | 1,267925 | −2,071467 | 17,422413 |
+| Päivittäin vaihtuva | ≥ +0,10 % | 0,975836 | 15 | 66,666667 | 2,467244 | −0,275011 | 65,055731 |
+
+Samalla SPY-asetuksella päivittäin vaihtuvan järjestyksen tuottoero alkuperäiseen oli ilman porttia +0,698895 prosenttiyksikköä ja portilla +0,452488 prosenttiyksikköä. Ilman porttia suurin arvonlasku syveni, portilla pieneni. Elokuussa järjestyksen tuottoerot olivat negatiivisia molemmilla SPY-asetuksilla. Portti vähensi kauppoja 69:stä 15:een; sen tuottovaikutus oli eri suuntainen kahdella järjestyksellä. Portin sallimien päivien määrä ja parittaisten erojen epävarmuus luetaan paikallisesta raportista eikä niitä päätellä tästä taulukosta. Ei parametrien vaihtoa, uutta sovitusta tai tuotantopäätöstä.
