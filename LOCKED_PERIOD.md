@@ -39,4 +39,17 @@ Käyttäjän lähettämä konsoliyhteenveto, `lukittu-20261109-151005`, tila `co
 | Päivittäin vaihtuva | Ei | 1,202146 | 69 | 49,275362 | 1,267925 | −2,071467 | 17,422413 |
 | Päivittäin vaihtuva | ≥ +0,10 % | 0,975836 | 15 | 66,666667 | 2,467244 | −0,275011 | 65,055731 |
 
-Samalla SPY-asetuksella päivittäin vaihtuvan järjestyksen tuottoero alkuperäiseen oli ilman porttia +0,698895 prosenttiyksikköä ja portilla +0,452488 prosenttiyksikköä. Ilman porttia suurin arvonlasku syveni, portilla pieneni. Elokuussa järjestyksen tuottoerot olivat negatiivisia molemmilla SPY-asetuksilla. Portti vähensi kauppoja 69:stä 15:een; sen tuottovaikutus oli eri suuntainen kahdella järjestyksellä. Portin sallimien päivien määrä ja parittaisten erojen epävarmuus luetaan paikallisesta raportista eikä niitä päätellä tästä taulukosta. Ei parametrien vaihtoa, uutta sovitusta tai tuotantopäätöstä.
+Samalla SPY-asetuksella päivittäin vaihtuvan järjestyksen tuottoero alkuperäiseen oli ilman porttia +0,698895 prosenttiyksikköä ja portilla +0,452488 prosenttiyksikköä. Ilman porttia suurin arvonlasku syveni, portilla pieneni. Elokuussa järjestyksen tuottoerot olivat negatiivisia molemmilla SPY-asetuksilla. Portti vähensi kauppoja 69:stä 15:een; sen tuottovaikutus oli eri suuntainen kahdella järjestyksellä. Paikallisen raportin parittaiset tulokset on kirjattu alle. Ei parametrien vaihtoa, uutta sovitusta tai tuotantopäätöstä.
+
+### Parittaiset päivätuottoerot
+
+Lähde: saman ajon käyttäjän toimittama report.json-ote. SPY-portti salli kaupankäynnin 3/14 päivänä. Kummassakin suodatetussa vaihtoehdossa kaikki 15 kauppaa ajoittuivat näille päiville; 11 muuta päivää ovat mukana vertailussa nollatuotolla. Taulukossa erot ovat korkopisteitä päivässä (1 bp = 0,01 prosenttiyksikköä). Positiivinen ero tarkoittaa, että ensin mainittu vaihtoehto tuotti kyseisenä päivänä enemmän; tasapäiviä ei lasketa positiivisiksi.
+
+| Vertailu (ensimmäinen miinus toinen) | Keskiero (bp/pv) | 95 % lohkobootstrap-väli (bp/pv) | Positiivisen eron päiviä |
+|---|---:|---:|---:|
+| SPY-portilla vs. ilman, alkuperäinen järjestys | +0,04 | −5,77 … +25,78 | 5/14 |
+| SPY-portilla vs. ilman, vaihtuva järjestys | −1,68 | −12,68 … +25,62 | 8/14 |
+| Vaihtuva vs. alkuperäinen järjestys, ilman porttia | +4,94 | −10,36 … +22,37 | 6/14 |
+| Vaihtuva vs. alkuperäinen järjestys, portilla | +3,22 | −6,34 … +14,21 | 2/14 |
+
+Kaikki neljä väliä sisältävät nollan. Arviot kuvaavat 14 istunnon jaksoa (5 päivän lohkot, 2 000 uudelleenotantaa, siemen 20261023). Uudelleenotannat eivät lisää havaittujen päivien määrää. Nämä välit koskevat päivätuottoeroa, eivät suurimman arvonlaskun eroa. Raportin independent_evidence on false kaikissa vertailuissa. Oletusasetukset säilyvät ennallaan.
