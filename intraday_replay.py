@@ -74,7 +74,8 @@ def _previous_clock(clock):
 
 
 def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, cfg,
-                    spy_opening_gate=None, require_spy=False, session_closes=None):
+                    spy_opening_gate=None, require_spy=False, session_closes=None,
+                    decision_sink=None):
     """Return (cash_equity, trades, daily, five_minute_equity).
 
     Scan at 09:35, 09:40, ... 15:25 ET using only the PREVIOUS completed
@@ -83,6 +84,9 @@ def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, c
     not hindsight-ranked. Positions coexist with open-position and exposure
     caps. A symbol cannot be entered more than once per NY session.
 
+    decision_sink receives observational records only; it cannot change orders.
+    Blocked scan tails are NOT assessed for signal eligibility. Sink failures
+    propagate so a run with an incomplete requested log cannot be accepted.
     The SPY filter is available after 09:35; it is NEVER applied to OPG.
     """
     validate_config(cfg)
@@ -102,6 +106,17 @@ def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, c
     signals = {s: _signal_book(scored_by_symbol[s]) for s in symbols if s in scored_by_symbol}
     days = sorted({d for symbol_bars in prices.values() for d, clock in symbol_bars})
     strict = bool(cfg.get("strict_price_coverage", True))
+
+    def record(symbol, order, reason, *, evaluated=False, **details):
+        if decision_sink is not None:
+            decision_sink(dict(date=date, scan_ts=ts.isoformat(), symbol=symbol,
+                               symbol_order=order+1, sector=sectors.get(symbol, "Unknown"),
+                               reason=reason, signal_evaluated=evaluated, **details))
+
+    def blocked_tail(first, reason):
+        if decision_sink is not None:
+            for index in range(first, len(symbols)):
+                record(symbols[index], index, reason)
 
     def equity(mark_prices=None):
         marks = mark_prices or {}
@@ -185,12 +200,15 @@ def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, c
                 prev = _previous_clock(clock)
                 for order, symbol in enumerate(symbols):
                     if gated or count >= int(cfg["max_trades_per_day"]):
+                        blocked_tail(order, "spy_gate_not_evaluated" if gated else "daily_trade_limit_not_evaluated")
                         break
                     if symbol in positions or symbol in traded_today:
+                        record(symbol, order, "already_held_or_traded")
                         continue
                     signal = signals.get(symbol, {}).get((date, prev))
                     bar = current.get(symbol)
                     if signal is None or bar is None:
+                        record(symbol, order, "missing_signal" if signal is None else "missing_entry_bar")
                         continue
                     ml = float(signal["ml_prob"])
                     if not np.isfinite(float(signal["news_score"])):
@@ -199,23 +217,30 @@ def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, c
                     if not (np.isfinite(ml) and np.isfinite(score)
                             and ml >= float(cfg["probability_threshold"])
                             and score >= float(cfg["trade_score_threshold"])):
+                        record(symbol, order, "threshold_not_met", evaluated=True)
                         continue
                     available_equity = equity(mark_open)
                     if available_equity <= start_equity*(1-float(cfg["max_daily_loss_pct"])):
+                        record(symbol, order, "daily_loss_limit", evaluated=True)
+                        blocked_tail(order+1, "daily_loss_limit_not_evaluated")
                         break
                     if len(positions) >= int(cfg["max_open_positions"]):
+                        record(symbol, order, "open_position_limit", evaluated=True)
                         continue
                     reference = float(bar["open"])
                     if not np.isfinite(reference) or reference <= 0:
+                        record(symbol, order, "invalid_reference", evaluated=True)
                         continue
                     entry = reference*(1+slip)
                     atr = float(signal["atr"])
                     if not np.isfinite(atr) or atr <= 0:
+                        record(symbol, order, "invalid_atr", evaluated=True)
                         continue
                     dist = max(atr*float(cfg["stop_atr_multiplier"]), reference*0.0125)
                     stop = round(reference-dist, 2)
                     target = round(reference+dist*float(cfg["reward_risk_ratio"]), 2)
                     if stop <= 0 or stop >= entry or target <= entry:
+                        record(symbol, order, "invalid_bracket", evaluated=True)
                         continue
                     # Include modeled entry/stop execution costs in the risk
                     # budget. commission_per_trade is one ROUND-TRIP fee,
@@ -231,7 +256,10 @@ def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, c
                     exposure_qty = int(max(0., available_equity*cap-exposure)/(entry + cap*cost_per_share))
                     cash_qty = int(max(0., cash-commission*(len(positions)+1))/entry)
                     qty = min(risk_qty, cap_qty, exposure_qty, cash_qty)
+                    sizing = dict(risk_qty=risk_qty, position_qty=cap_qty,
+                                  exposure_qty=exposure_qty, cash_qty=cash_qty)
                     if qty < 1:
+                        record(symbol, order, "size_below_one", evaluated=True, **sizing)
                         continue
                     cash -= entry*qty
                     positions[symbol] = {
@@ -252,6 +280,9 @@ def replay_intraday(scored_by_symbol, full_prices_by_symbol, symbols, sectors, c
                     }
                     traded_today.add(symbol)
                     count += 1
+                    record(symbol, order, "entered", evaluated=True, qty=qty,
+                           signal_bar_ts=pd.Timestamp(signal["timestamp"]).isoformat(),
+                           ml_prob=ml, trade_score=score, **sizing)
 
             # After all new orders have been decided, apply this bar's
             # high/low to positions. Stops win if both are touched.

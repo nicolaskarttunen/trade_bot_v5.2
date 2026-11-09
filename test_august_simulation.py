@@ -105,6 +105,17 @@ class AugustSimulationTests(unittest.TestCase):
         comparison = json.loads((self.root/"complete/spy_comparison.json").read_text())
         self.assertEqual(comparison["sessions"], 21)
         self.assertEqual(comparison["gate_allowed_sessions"], 0)
+        self.assertEqual(result["ledger_checks"], "passed_ledger_checks")
+        audits = json.loads((self.root/"complete/ledger_audit.json").read_text())
+        self.assertTrue(all(a["issues"] == [] for a in audits.values()))
+        events = [json.loads(line) for line in (self.root/"complete/decisions.jsonl").read_text().splitlines()]
+        gated = [e for e in events if e["strategy"] == "intraday_order_spy_ge010"]
+        self.assertTrue(gated)
+        self.assertTrue(all(e["reason"] == "spy_gate_not_evaluated" for e in gated))
+        from tools.audit_simulation_run import audit_run
+        result = audit_run(self.root/"complete", self.root/"external-audit")
+        self.assertEqual(result["status"], "passed_ledger_checks")
+        self.assertTrue(result["decision_log_available"])
 
     def force_signals(self):
         self.stack.enter_context(patch.object(runner, "fit_bundle", return_value={"feature_contract": {}}))
@@ -133,6 +144,16 @@ class AugustSimulationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Input changed"):
                 runner.run(self.data, self.root/"mutation", execute=True)
         self.assertFalse((self.root/"mutation/summary.csv").exists())
+
+    def test_failed_ledger_check_prevents_performance_outputs(self):
+        self.force_signals()
+        with patch.object(runner, "audit_frames", return_value={"status":"failed_ledger_checks", "issues":["injected"]}):
+            with self.assertRaisesRegex(ValueError, "Ledger checks failed"):
+                runner.run(self.data, self.root/"ledger-fail", execute=True)
+        self.assertFalse((self.root/"ledger-fail/summary.csv").exists())
+        self.assertFalse((self.root/"ledger-fail/trades.csv").exists())
+        report=json.loads((self.root/"ledger-fail/run_report.json").read_text())
+        self.assertEqual(report["status"], "failed_not_validated")
 
     def test_network_is_blocked_during_training(self):
         def attempt(*args, **kwargs):

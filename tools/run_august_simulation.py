@@ -32,6 +32,7 @@ from model_pipeline import fit_bundle, predict_bundle, trade_score, training_row
 from intraday_replay import replay_intraday, as_day_clock
 from research_validation import input_manifest, build_spy_gate, paired_daily_comparison
 from disk_training import TrainingStore, fit_disk_bundle, RECORD, BLOCK_ROWS
+from replay_audit import audit_frames
 
 WINDOW = ("2023-01-01", "2026-07-31", "2026-08-01", "2026-08-31")
 CALENDAR = BASE / "research_calendars/nyse_2026_08.csv"
@@ -111,7 +112,7 @@ def prepare(frame, market, cfg):
 
 
 def replay_by_session(scored, prices, symbols, sectors, cfg, *, spy_opening_gate,
-                      require_spy, session_closes):
+                      require_spy, session_closes, decision_sink=None):
     """Same engine, one flat-to-flat session at a time; carry actual cash."""
     cash = float(cfg["initial_cash"])
     trades, daily, curves = [], [], []
@@ -124,7 +125,8 @@ def replay_by_session(scored, prices, symbols, sectors, cfg, *, spy_opening_gate
         cash, t, d, c = replay_intraday(
             select(scored), select(prices), symbols, sectors,
             dict(cfg, initial_cash=cash), spy_opening_gate=spy_opening_gate,
-            require_spy=require_spy, session_closes={day: session_closes[day]})
+            require_spy=require_spy, session_closes={day: session_closes[day]},
+            decision_sink=decision_sink)
         if len(d) != 1 or str(d.iloc[0]["date"]) != day:
             raise ValueError(f"Missing replay session {day}")
         if not t.empty:
@@ -187,6 +189,7 @@ def run(data_dir, output_dir, execute=False, low_memory=False):
             manifest["input_sha256"][str(CALENDAR)] = digest(CALENDAR)
             manifest["source_sha256"]["tools/run_august_simulation.py"] = digest(Path(__file__))
             manifest["source_sha256"]["disk_training.py"] = digest(BASE / "disk_training.py")
+            manifest["source_sha256"]["replay_audit.py"] = digest(BASE / "replay_audit.py")
             manifest.update(classification=report["classification"], feed_assumption="sip",
                             full_feed_adjustment_provenance_verified=False, status="inputs_checked",
                             low_memory=low_memory)
@@ -248,26 +251,40 @@ def run(data_dir, output_dir, execute=False, low_memory=False):
                     scored[symbol] = x
                 test_frames.clear()
                 daily_outputs, trade_outputs, curve_outputs, summary = [], [], [], []
+                ledger_audits = {}
+                decisions = stack.enter_context((output_dir / "decisions.jsonl").open("w", encoding="utf-8"))
                 for strategy in reference.STRATEGIES:
+                    def decision_sink(event):
+                        decisions.write(json.dumps(dict(event, strategy=strategy["name"]), allow_nan=False)+"\n")
                     report.update(status="replaying", active_arm=strategy["name"])
                     write_json(report_path, report)
                     print(f"Replaying {strategy['name']}", flush=True)
                     replay = replay_by_session if low_memory else replay_intraday
                     cash, trades, daily, curve = replay(
                         scored, prices, symbols, reference.SECTOR_BY_SYMBOL, cfg,
-                        spy_opening_gate=gate, require_spy=strategy["spy_gate"], session_closes=sessions)
+                        spy_opening_gate=gate, require_spy=strategy["spy_gate"], session_closes=sessions,
+                        decision_sink=decision_sink)
                     if set(daily.date) != set(sessions) or len(daily) != len(sessions):
                         raise ValueError("Replay did not preserve every session")
                     summary.append(dict(strategy=strategy["name"],
                                         **reference.metrics(cfg["initial_cash"], cash, trades, daily, curve)))
+                    audit = audit_frames(trades, daily, curve, pd.DataFrame([summary[-1]]),
+                                         cfg, symbols, sessions, reference.SECTOR_BY_SYMBOL)
+                    ledger_audits[strategy["name"]] = audit
+                    if audit["status"] != "passed_ledger_checks":
+                        raise ValueError(f"Ledger checks failed: {audit['issues']}")
                     for frame, collection in [(trades, trade_outputs), (daily, daily_outputs), (curve, curve_outputs)]:
                         collection.append(frame.assign(strategy=strategy["name"]))
+                decisions.close()
                 # Do not publish partial-arm performance when either arm fails.
                 if any(digest(p) != report["input_sha256"][str(p)] for p in paths.values()):
                     raise ValueError("Input changed during replay")
                 for name, frames in [("trades", trade_outputs), ("daily", daily_outputs), ("equity", curve_outputs)]:
                     pd.concat(frames, ignore_index=True).to_csv(output_dir / f"{name}.csv", index=False)
                 pd.DataFrame(summary).to_csv(output_dir / "summary.csv", index=False)
+                write_json(output_dir / "ledger_audit.json", ledger_audits)
+                report["ledger_checks"] = "passed_ledger_checks"
+                report["decision_log"] = "decisions.jsonl"
                 comparison = paired_daily_comparison(daily_outputs[0], daily_outputs[1])
                 comparison.update(classification="august_development_only", independent_evidence=False)
                 comparison["gate_allowed_sessions"] = sum(bool(gate[d]) for d in sessions)
