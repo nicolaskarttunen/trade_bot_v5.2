@@ -33,9 +33,11 @@ jobs:
       - name: Validate user task definition without registration
         if: runner.os == 'Windows'
         shell: powershell
-        run: .\tools\start_forward.ps1 -ValidateOnly
+        run: |
+          .\tools\start_forward.ps1 -ValidateOnly
+          .\tools\start_ml_pair.ps1 -ValidateOnly
       - name: Separate exploratory opening-priority trial on synthetic fixtures
-        run: python -m unittest test_open_priority test_cost_margin test_ml_filter_trial
+        run: python -m unittest test_open_priority test_cost_margin test_ml_filter_trial test_ml_forward_pair
       - name: Offline regressions with outbound sockets blocked
         run: python tools/run_audit_tests.py --output-dir test-artifacts
       - name: End-user offline simulation command
