@@ -24,3 +24,20 @@ Simulaatiokansion juuressa: `python tools/inspect_cost_margin.py research_runs/a
 Paikallinen tarkistus: 3/3 uutta kustannusraportin testiä sekä 3/3 aiempaa avauskokeen testiä läpi synteettisillä syötteillä. Käyttäjän aikaisemman ajon täydet kaupparivit eivät olleet tässä ympäristössä saatavilla; historiallista kustannusvaraa ei väitetä mitatuksi. Aiemmat oikean aineiston tulokset ja niiden alkuperä: [avauskoe](OPENING_PRIORITY_TRIAL.md), [lukittu jakso](LOCKED_PERIOD.md), [seuranta](FORWARD_SIMULATION.md).
 
 Tausta: [Alpacan paper-simulaation rajaukset](https://docs.alpaca.markets/us/docs/paper-trading) sekä [Bailey & López de Prado: useiden kokeiden valintaharha](https://doi.org/10.3905/jpm.2014.40.5.094).
+
+## Pöytäkoneen kulutulos 10.11.2026
+
+Käyttäjän toimittama tuloste, työkalun versio `ac9af1a`, lähdeajo `avaussignaali-20261110-150815`. Kehitysympäristössä ei ajettu samoja yksityisiä kauppalokeja uudelleen. Tulosdollarit ovat simuloituja. Lisäkulu laskettiin erikseen jokaisen oston ja myynnin arvosta, nykyisten mallinnettujen kustannusten päälle. Muut päivät -sarake on peruskuluilla ja jättää kunkin vaihtoehdon oman parhaan päivän pois; muut sarakkeet sisältävät kaikki päivät.
+
+| Jakso | Vaihtoehto | Kauppoja | Netto USD | Muut päivät USD | +1 bp/puoli USD | +3 bp/puoli USD | Lisäkulu nollatulokseen bp/puoli |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Elokuu | original_no_gate | 100 | 431,17 | −742,29 | 233,29 | −162,47 | 2,18 |
+| Elokuu | original_spy_ge010 | 20 | 287,15 | −886,32 | 247,73 | 168,90 | 7,28 |
+| Elokuu | opening_ml_no_gate | 100 | 324,89 | −452,97 | 129,38 | −261,63 | 1,66 |
+| Elokuu | opening_ml_spy_ge010 | 20 | −423,95 | −759,07 | −463,02 | −541,16 | −10,85 |
+| 20.10.–6.11. | original_no_gate | 69 | 503,25 | −327,90 | 366,48 | 92,93 | 3,68 |
+| 20.10.–6.11. | original_spy_ge010 | 15 | 523,35 | 54,07 | 493,71 | 434,42 | 17,66 |
+| 20.10.–6.11. | opening_ml_no_gate | 69 | −639,58 | −1 500,56 | −774,56 | −1 044,52 | −4,74 |
+| 20.10.–6.11. | opening_ml_spy_ge010 | 15 | −386,65 | −482,67 | −416,26 | −475,49 | −13,06 |
+
+Alkuperäinen ilman avausporttia kesti +1 bp:n lisäkulun molemmilla jaksoilla, +3 bp:n vain jälkimmäisellä. Sen muiden päivien summa oli molemmissa negatiivinen jo peruskuluilla. Alkuperäinen avausportti kesti +3 bp molemmissa jaksoissa, mutta elokuussa muiden päivien summa oli −886,32 USD ja jälkimmäisellä jaksolla vain +54,07 USD. Kauppapäiviä portilla oli 4/21 ja 3/14. Tämä mittaa samojen kauppojen herkkyyttä lisämaksulle, ei välittäjän toteumia tai ennusteen pysyvää etua. Pidetään avauspriorisointi poissa ja seuranta ennallaan. Seuraava erillinen diagnostinen kysymys on kohdassa 2 kuvattu ML:n lisäarvo samalla markkinaehdolla.
