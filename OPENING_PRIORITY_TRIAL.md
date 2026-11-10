@@ -23,3 +23,16 @@ Valmiin kokeen tila on `completed_exploratory_trial`. Molemmissa alakansioissa s
 Testit: `python -m unittest test_open_priority`. Keinotekoisilla hinnoilla testataan avauskynttilän aikaleima, puuttuva ennuste, tasapisteet, tulevien ennusteiden riippumattomuus, päivärajan sitoma valinta, SPY-portti sekä kummankin jakson kirjanpidon toistaminen jäädytetystä aineistosta. Väärennetty vertailutulos hylätään, vaikka sille annettaisiin vastaava tiedostotiiviste. Aitoja 100 osakkeen paikallisia tuloksia tästä kokeesta ei ole saatu kehitysympäristössä.
 
 10.11.2026: kaikki kolme uutta testiä läpäistiin Linuxissa sekä pandas 2.2.3:lla että 3.0.0:lla. Uusi testi on erillinen CI-vaihe; se ei muuta alkuperäistä neljän vaihtoehdon protokollaa.
+
+## Pöytäkoneen simulaatio 10.11.2026
+
+Käyttäjän toimittama PowerShell-tuloste: ohjelmaversio `532ed41`, ajokansio `research_runs/avaussignaali-20261110-150815`, tila `completed_exploratory_trial`. Luvut ovat tulosteen jaksoyhteenvetoja, eivät uutta ajoa kehitysympäristössä. Ero on avaussignaalin mukaan järjestetyn ja alkuperäisen vaihtoehdon jaksojen tuottojen erotus prosenttiyksikköinä.
+
+| Jakso | SPY +0,10 % | Kauppoja / vaihtoehto | Alkuperäinen tuotto | Avausjärjestyksen tuotto | Ero | Suurin arvonlasku, alkuperäinen → avaus |
+|---|---|---:|---:|---:|---:|---:|
+| Elokuu (21 päivää) | ei | 100 | +0,4312 % | +0,3249 % | −0,1063 | −2,1597 % → −1,8552 % |
+| Elokuu | kyllä | 20 | +0,2871 % | −0,4240 % | −0,7111 | −0,7518 % → −0,8023 % |
+| 20.10.–6.11. (14 päivää) | ei | 69 | +0,5033 % | −0,6396 % | −1,1428 | −1,5861 % → −1,6626 % |
+| 20.10.–6.11. | kyllä | 15 | +0,5233 % | −0,3867 % | −0,9100 | −0,4500 % → −0,9298 % |
+
+Kauppamäärä pysyi samana kussakin vertailuparissa, mutta avausjärjestyksen tuotto ja profit factor olivat pienemmät kaikissa neljässä. Suurin arvonlasku pieneni vain elokuussa ilman porttia. Parittaisen päivätuottoeron estimaattia ja epävarmuusväliä ei ollut toimitetussa tulosteessa; taulukon erot eivät korvaa niitä. Jaksot oli katsottu aiemmin, eivätkä saman jakson kaksi SPY-vaihtoehtoa ole riippumattomia toistoja. Päätös: avaussignaalin mukaista järjestystä ei oteta käyttöön. Näillä jaksoilla ei valita uutta kynnystä tai järjestystä, eikä käynnissä olevaa neljän vaihtoehdon seurantaa muuteta.
