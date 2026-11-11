@@ -27,6 +27,7 @@ from alpaca.common.enums import Sort
 from order_journal import OrderJournal, OrderBlocked, ProcessLock
 from order_lifecycle import OrderLifecycle
 from paper_order_adapter import PaperTradingClient, lookup_nested, open_orders, protective_request
+from entry_selection import rank_entry_candidates, long_trade_plan, valid_opening_selection, SELECTION_POLICY
 
 ORDER_LIFECYCLE = None
 ORDER_PROCESS_LOCK = None
@@ -68,6 +69,7 @@ NEWS_FILE = BASE / "news_live_history.json"
 TRADE_FILE = BASE / "trades.csv"
 STATE_FILE = BASE / "paper_live_state.json"
 ORDER_NOTIFICATION_FILE = BASE / "paper_order_notifications.json"
+ENTRY_SCAN_FILE = BASE / "entry_scan.json"
 
 news_lock = threading.Lock()
 news_items = []
@@ -287,8 +289,11 @@ def get_latest_trade_price(symbol):
         return None
 
 
-def get_bars(symbol, limit=250):
-    end = datetime.now(timezone.utc)
+def get_bars(symbol, limit=250, as_of=None):
+    if as_of is None:
+        end = datetime.now(timezone.utc)
+    else:
+        end = pd.Timestamp(as_of).to_pydatetime()
     start = end - timedelta(days=5)
 
     request = StockBarsRequest(
@@ -380,17 +385,20 @@ def get_benchmark():
     return get_bars(BENCHMARK, 250)
 
 
-def get_ml_probability(symbol):
+def get_ml_probability(symbol, *, benchmark=None, as_of=None, news=None):
     # Fix the decision time before fetching both inputs. Ignore bars completing
     # during a long request; the caller's freshness check can then reject it.
-    as_of = pd.Timestamp.now(tz="UTC")
-    df = get_bars(symbol, 250)
-    benchmark = get_benchmark()
+    if as_of is None:
+        as_of = pd.Timestamp.now(tz="UTC")
+    df = get_bars(symbol, 250, as_of=as_of)
+    if benchmark is None:
+        benchmark = get_bars(BENCHMARK, 250, as_of=as_of)
     if df.empty or benchmark.empty:
         return None, None
-    with news_lock:
-        items = [dict(item) for item in news_items
-                 if symbol in (item.get("symbols") or [])]
+    if news is None:
+        with news_lock:
+            news = [dict(item) for item in news_items]
+    items = [item for item in news if symbol in (item.get("symbols") or [])]
     return latest_signal(df, benchmark, items, MODEL, CFG, as_of)
 
 
@@ -515,12 +523,12 @@ def telegram_loop():
                         for item in reversed(items):
                             decision = item["decision"]
 
-                            if decision == "BUY":
+                            if decision in ("BUY", "SUBMITTED"):
                                 icon = "\U0001F7E2"
                                 decision_text = "BUY"
                             else:
                                 icon = "\U0001F7E1"
-                                decision_text = "NO TRADE"
+                                decision_text = decision
 
                             lines.extend([
                                 f"{icon} {item['symbol']}",
@@ -531,6 +539,14 @@ def telegram_loop():
                                 f"\u27A1\uFE0F {decision_text}",
                                 ""
                             ])
+                            plan = item.get("plan")
+                            if plan:
+                                lines.extend([
+                                    f"Määrä {plan['quantity']} | SL ${plan['stop_price']:.2f} | TP ${plan['target_price']:.2f}",
+                                    f"Tavoitteella kulujen jälkeen ${plan['target_net_pnl_usd']:+.2f}",
+                                    f"Stopilla kulujen jälkeen ${plan['stop_net_pnl_usd']:+.2f}",
+                                    "",
+                                ])
 
                         telegram_send("\n".join(lines))
 
@@ -541,6 +557,7 @@ def telegram_loop():
                         "/stop – estä uudet treidit\n"
                         "/status – botin tila\n"
                         "/positions – avoimet positiot\n"
+                        "/signals 5 – viimeisimmät ostoehdokkaat ja tuottoskenaariot\n"
                         "/help – komennot"
                     )
 
@@ -935,6 +952,7 @@ def submit_opening_order(
     probability,
     score,
     news_score,
+    selection=None,
 ):
     """Queue a PAPER opening candidate. No order is sent before 09:30 ET."""
 
@@ -967,6 +985,7 @@ def submit_opening_order(
         "reference_price": float(reference_price),
         "status": "queued",
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "selection": selection,
     }
 
     atomic_json(opening_file, opening_orders)
@@ -985,7 +1004,9 @@ def submit_opening_order(
 
 
 
-def submit_paper_long(symbol, reference_price, probability, score, news_score, row, opening=False):
+def submit_paper_long(symbol, reference_price, probability, score, news_score, row, opening=False, review=None):
+    if not telegram_trading_enabled:
+        return
     require_entry_ready(allow_queue=opening)
     state = get_daily_state()
 
@@ -1012,6 +1033,9 @@ def submit_paper_long(symbol, reference_price, probability, score, news_score, r
     if symbol in get_positions():
         return
 
+    if not opening and not is_fresh_intraday_row(symbol, row):
+        return
+
     # Use a fresh market price for actual order pricing.
     # The 5-minute row is still used for ML features and ATR.
     signal_price = reference_price
@@ -1033,37 +1057,11 @@ def submit_paper_long(symbol, reference_price, probability, score, news_score, r
         f"diff_pct={(reference_price / signal_price - 1.0) * 100:+.2f}%"
     )
 
-    # Risk budget.
-    risk_dollars = equity * float(CFG["risk_per_trade_pct"])
-
-    # ATR-based stop distance.
-    # ATR comes from the signal bar, but SL/TP are anchored
-    # to the fresh market price.
-    stop_distance = max(
-        float(row["atr"]) * float(CFG["stop_atr_multiplier"]),
-        reference_price * 0.0125
-    )
-
-    quantity_by_risk = int(
-        risk_dollars / stop_distance
-    )
-
-    # Hard position-size cap.
-    max_position_value = equity * float(CFG["max_position_pct"])
-
-    quantity_by_cap = int(
-        max_position_value / reference_price
-    )
-
-    quantity = min(
-        quantity_by_risk,
-        quantity_by_cap
-    )
-
+    plan = long_trade_plan(reference_price, row["atr"], equity, CFG)
     quantity = enforce_entry_limits(
         symbol=symbol,
         reference_price=reference_price,
-        requested_quantity=quantity,
+        requested_quantity=plan["quantity"],
         equity=equity,
         opening_orders=None,
     )
@@ -1074,16 +1072,15 @@ def submit_paper_long(symbol, reference_price, probability, score, news_score, r
         )
         return
 
-    stop_price = round(
-        reference_price - stop_distance,
-        2
-    )
-
-    target_price = round(
-        reference_price
-        + stop_distance * float(CFG["reward_risk_ratio"]),
-        2
-    )
+    plan = long_trade_plan(reference_price, row["atr"], equity, CFG, quantity_cap=quantity)
+    stop_distance = plan["stop_distance"]
+    stop_price, target_price = plan["stop_price"], plan["target_price"]
+    if review is not None:
+        review["plan"] = plan
+        review["priced_at"] = pd.Timestamp.now(tz="UTC").isoformat()
+    if plan["target_net_pnl_usd"] <= 0:
+        print(f"ORDER BLOCKED | {symbol} | target scenario does not cover modeled costs")
+        return
 
     if opening:
         order = submit_opening_order(
@@ -1095,6 +1092,7 @@ def submit_paper_long(symbol, reference_price, probability, score, news_score, r
             probability=probability,
             score=score,
             news_score=news_score,
+            selection=review.get("selection") if review is not None else None,
         )
 
         if order is None:
@@ -1125,7 +1123,7 @@ def submit_paper_long(symbol, reference_price, probability, score, news_score, r
             reason,
         )
 
-        return
+        return order
 
     order_request = MarketOrderRequest(
         symbol=symbol,
@@ -1154,9 +1152,14 @@ def submit_paper_long(symbol, reference_price, probability, score, news_score, r
         order_request.client_order_id = cid
         return order_request
     require_entry_ready()
+    if not telegram_trading_enabled or not is_fresh_intraday_row(symbol, row):
+        return
+    metadata = {"mode": "intraday", "stop_distance": stop_distance,
+                "reward_risk_ratio": float(CFG["reward_risk_ratio"])}
+    if review is not None:
+        metadata["selection"] = review.get("selection")
     order = ORDER_LIFECYCLE.submit_once(state["date"], symbol, "entry", request_factory,
-        reference_price, {"mode": "intraday", "stop_distance": stop_distance,
-                          "reward_risk_ratio": float(CFG["reward_risk_ratio"])})
+        reference_price, metadata)
 
     state["trades"] += 1
     traded_symbols = state.setdefault("traded_symbols", [])
@@ -1193,6 +1196,7 @@ def submit_paper_long(symbol, reference_price, probability, score, news_score, r
         f"TP={target_price:.2f} | "
         f"order_id={order.id}"
     )
+    return order
 
 
 
@@ -1447,6 +1451,9 @@ def _send_sell_fill_notification(order, entry_price=None):
 def submit_queued_opening_orders():
     """Submit queued PAPER opening candidates as DAY market BUYs."""
 
+    if not telegram_trading_enabled:
+        return
+
     opening_file = BASE / "opening_orders.json"
 
     if not opening_file.exists():
@@ -1476,6 +1483,12 @@ def submit_queued_opening_orders():
     for symbol, data in list(opening_orders.items()):
 
         if data.get("status") != "queued":
+            continue
+
+        if not valid_opening_selection(data.get("selection"), SYMBOLS):
+            data["status"] = "selection_required"
+            changed = True
+            print(f"OPENING SELECTION BLOCK | {symbol} | complete universe scan required")
             continue
 
         require_entry_ready()
@@ -1560,13 +1573,17 @@ def submit_queued_opening_orders():
         )
 
         try:
+            require_entry_ready()
+            if not telegram_trading_enabled:
+                break
             def request_factory(cid):
                 order_request.client_order_id = cid
                 return order_request
             order = ORDER_LIFECYCLE.submit_once(state["date"], symbol, "entry", request_factory,
                 latest_price, {"mode": "opening",
                     "stop_distance": float(data["reference_price"])-float(data["stop_price"]),
-                    "reward_risk_ratio": float(CFG["reward_risk_ratio"])})
+                    "reward_risk_ratio": float(CFG["reward_risk_ratio"]),
+                    "selection": data["selection"]})
         except Exception as exc:
             print(
                 f"OPENING MARKET ERROR | {symbol} | {exc!r}"
@@ -1720,178 +1737,174 @@ def check_filled_orders():
 # ------------------------------------------------------------
 
 
-def run_opening_scan():
-    """Run one daily premarket scan and submit up to the daily OPG limit."""
+def entry_scan_is_current(as_of, opening=False):
+    now = pd.Timestamp.now(tz="UTC")
+    if now.floor("5min") != as_of.floor("5min"):
+        return False
+    if opening:
+        local = now.tz_convert("America/New_York")
+        return local.hour == 9 and 15 <= local.minute < 28
+    return True
 
+
+def run_entry_scan(opening=False):
+    """Collect all symbols, review the top five, then consider paper orders."""
+    as_of = pd.Timestamp.now(tz="UTC")
     state = get_daily_state()
+    reached, equity, _ = daily_loss_reached(state)
+    if reached or state["trades"] >= int(CFG["max_trades_per_day"]):
+        return None
+    occupied, _ = get_portfolio_entry_usage()
+    blocked = occupied | set(state.get("traded_symbols", []))
+    report = {
+        "as_of": as_of.isoformat(),
+        "mode": "opening" if opening else "intraday",
+        "status": "scanning",
+        "universe_count": len(SYMBOLS),
+        "scanned_count": 0,
+        "complete": False,
+        "ranking": "score_desc_probability_desc_symbol_asc",
+        "model_event": {
+            "horizon_minutes": int(CFG["label_horizon_bars"]) * int(CFG["timeframe_minutes"]),
+            "minimum_price_increase_pct": 100 * float(CFG["label_threshold_pct"]),
+        },
+        "signals": [],
+        "top5": [],
+    }
+    atomic_json(ENTRY_SCAN_FILE, report)
+    benchmark = get_bars(BENCHMARK, 250, as_of=as_of)
+    with news_lock:
+        snapshot_news = [dict(item) for item in news_items]
+    candidates = []
+    for symbol in SYMBOLS:
+        maintain_order_lifecycle()
+        if not entry_scan_is_current(as_of, opening):
+            report["status"] = "expired"
+            atomic_json(ENTRY_SCAN_FILE, report)
+            return report
+        signal = {"symbol": symbol, "status": "unavailable"}
+        try:
+            probability, row = get_ml_probability(
+                symbol, benchmark=benchmark, as_of=as_of, news=snapshot_news
+            )
+            if probability is not None and row is not None:
+                news_score = float(row["news_score"])
+                score = calculate_trade_score(probability, row, news_score)
+                if not (math.isfinite(float(probability)) and 0 <= probability <= 1
+                        and math.isfinite(float(score))):
+                    raise ValueError("Invalid model probability or score")
+                candidate = {"symbol": symbol, "probability": float(probability),
+                             "score": float(score), "row": row}
+                candidates.append(candidate)
+                signal.update(status="blocked" if symbol in blocked else "evaluated",
+                              probability=float(probability), score=float(score),
+                              news_score=news_score, signal_price=float(row["close"]),
+                              bar_timestamp=pd.Timestamp(row["timestamp"]).isoformat())
+        except Exception as exc:
+            signal["error"] = str(exc)
+            print(f"ENTRY SCAN ERROR | {symbol} | {exc!r}")
+        report["signals"].append(signal)
+        report["scanned_count"] += 1
 
+    report["complete"] = True
+    if not entry_scan_is_current(as_of, opening):
+        report["status"] = "expired"
+        atomic_json(ENTRY_SCAN_FILE, report)
+        return report
+    shortlist = rank_entry_candidates(candidates, CFG, blocked)
+    print(f"ENTRY SCAN | scanned={report['scanned_count']}/{len(SYMBOLS)} | top5={len(shortlist)}")
+
+    # Research every shortlisted symbol before any order is submitted.
+    for rank, candidate in enumerate(shortlist, start=1):
+        row = candidate["row"]
+        review = {"rank": rank, "symbol": candidate["symbol"],
+                  "probability": candidate["probability"], "score": candidate["score"],
+                  "decision": "unavailable", "plan": None,
+                  "selection": {"policy": SELECTION_POLICY, "as_of": as_of.isoformat(),
+                                "symbols": list(SYMBOLS), "scanned_count": report["scanned_count"],
+                                "complete": report["complete"], "rank": rank},
+                  "technical": {name: float(row[name]) for name in (
+                      "ret_3", "market_ret_3", "rsi14", "volume_ratio", "atr", "news_score"
+                  )}}
+        report["top5"].append(review)
+        try:
+            price = get_latest_trade_price(candidate["symbol"])
+            if price is None:
+                continue
+            review["plan"] = long_trade_plan(price, row["atr"], equity, CFG)
+            review["priced_at"] = pd.Timestamp.now(tz="UTC").isoformat()
+            plan = review["plan"]
+            if plan["quantity"] > 0 and plan["target_net_pnl_usd"] > 0:
+                review["decision"] = "reviewed"
+            else:
+                review["decision"] = "blocked"
+            print(f"TOP {rank} | {candidate['symbol']} | score={candidate['score']:.1f} | "
+                  f"qty={plan['quantity']} | target_net=${plan['target_net_pnl_usd']:.2f} | "
+                  f"stop_net=${plan['stop_net_pnl_usd']:.2f}")
+        except (ValueError, RuntimeError, KeyError, TypeError, OSError) as exc:
+            review["error"] = str(exc)
+    report["status"] = "reviewed"
+    atomic_json(ENTRY_SCAN_FILE, report)
+
+    available_slots = int(CFG["max_trades_per_day"]) - int(state["trades"])
+    submitted = 0
+    for candidate, review in zip(shortlist, report["top5"]):
+        if not entry_scan_is_current(as_of, opening):
+            report["status"] = "expired"
+            break
+        if not telegram_trading_enabled:
+            report["status"] = "paused"
+            break
+        if review["decision"] != "reviewed" or submitted >= available_slots:
+            continue
+        review["decision"] = "submission_pending"
+        atomic_json(ENTRY_SCAN_FILE, report)
+        try:
+            order = submit_paper_long(
+                candidate["symbol"], float(candidate["row"]["close"]),
+                candidate["probability"], candidate["score"],
+                float(candidate["row"]["news_score"]), candidate["row"],
+                opening=opening, review=review,
+            )
+            if order is None:
+                review["decision"] = "blocked"
+            else:
+                review["decision"] = "queued" if opening else "submitted"
+                submitted += 1
+                review["order_id"] = str(order.id)
+        except Exception as exc:
+            review["decision"] = "submission_error"
+            review["error"] = str(exc)
+            report["status"] = "submission_error"
+            atomic_json(ENTRY_SCAN_FILE, report)
+            raise
+        atomic_json(ENTRY_SCAN_FILE, report)
+    if report["status"] == "reviewed":
+        report["status"] = "complete"
+    report["submitted_count"] = submitted
+    atomic_json(ENTRY_SCAN_FILE, report)
+
+    with telegram_lock:
+        for review in reversed(report["top5"]):
+            telegram_signals.append({
+                "time": as_of.tz_convert("America/New_York").strftime("%H:%M:%S ET"),
+                "symbol": review["symbol"], "ml": review["probability"],
+                "score": review["score"], "news": review["technical"]["news_score"],
+                "decision": review["decision"].upper(), "plan": review["plan"],
+            })
+        del telegram_signals[:-100]
+    return report
+
+
+def run_opening_scan():
+    state = get_daily_state()
     if state.get("opening_scan_done", False):
         return
-
-    reached, equity, start_equity = daily_loss_reached(state)
-
-    if reached:
-        print(
-            f"OPENING SCAN BLOCKED | daily loss limit | "
-            f"equity={equity:.2f} | start={start_equity:.2f}"
-        )
-        return
-
-    max_trades = int(CFG["max_trades_per_day"])
-    available_slots = max(
-        0,
-        max_trades - int(state["trades"])
-    )
-
-    if available_slots <= 0:
-        print("OPENING SCAN | no daily trade slots available")
+    report = run_entry_scan(opening=True)
+    if report is not None and report["complete"] and report["status"] == "complete":
+        state = get_daily_state()
         state["opening_scan_done"] = True
         save_state(state)
-        return
-
-    print(
-        f"OPENING SCAN START | "
-        f"symbols={len(SYMBOLS)} | "
-        f"max_opg={available_slots}"
-    )
-
-    submitted = 0
-    current_positions = get_positions()
-
-    for symbol in SYMBOLS:
-        # Never send more OPG entries than the remaining daily slots.
-        if submitted >= available_slots:
-            break
-
-        # Stop sending new OPG orders if we have reached Alpaca's
-        # opening-auction cutoff window.
-        now_et = pd.Timestamp.now(
-            tz="America/New_York"
-        )
-
-        if (
-            now_et.hour > 9
-            or (
-                now_et.hour == 9
-                and now_et.minute >= 28
-            )
-        ):
-            print(
-                "OPENING SCAN STOP | "
-                "09:28 ET OPG cutoff reached"
-            )
-            break
-
-        if symbol in current_positions:
-            continue
-
-        probability, row = get_ml_probability(symbol)
-
-        if probability is None:
-            continue
-
-        recent_news, news_change = float(row["news_score"]), 0.0
-
-        trade_score = calculate_trade_score(
-            probability,
-            row,
-            recent_news,
-        )
-
-        print(
-            f"OPENING | {symbol} | "
-            f"close={float(row.close):.2f} | "
-            f"ML={probability:.3f} | "
-            f"NEWS={recent_news:+.3f} | "
-            f"SCORE={trade_score:.1f}"
-        )
-
-        signal_decision = (
-            "BUY"
-            if (
-                telegram_trading_enabled
-                and probability
-                >= float(CFG["probability_threshold"])
-                and trade_score
-                >= float(CFG["trade_score_threshold"])
-            )
-            else "NO TRADE"
-        )
-
-        with telegram_lock:
-            telegram_signals.append({
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "symbol": symbol,
-                "ml": float(probability),
-                "score": float(trade_score),
-                "news": float(recent_news),
-                "decision": signal_decision,
-            })
-
-            if len(telegram_signals) > 100:
-                del telegram_signals[:-100]
-
-        if not telegram_trading_enabled:
-            continue
-
-        if (
-            probability
-            >= float(CFG["probability_threshold"])
-            and trade_score
-            >= float(CFG["trade_score_threshold"])
-        ):
-            before_file = BASE / "opening_orders.json"
-            before_count = 0
-
-            if before_file.exists():
-                try:
-                    before_count = len(
-                        json.loads(
-                            before_file.read_text(
-                                encoding="utf-8"
-                            )
-                        )
-                    )
-                except Exception:
-                    before_count = 0
-
-            submit_paper_long(
-                symbol,
-                float(row.close),
-                probability,
-                trade_score,
-                recent_news,
-                row,
-                opening=True,
-            )
-
-            after_count = before_count
-
-            if before_file.exists():
-                try:
-                    after_count = len(
-                        json.loads(
-                            before_file.read_text(
-                                encoding="utf-8"
-                            )
-                        )
-                    )
-                except Exception:
-                    after_count = before_count
-
-            if after_count > before_count:
-                submitted += 1
-
-    # Mark complete only after the scan itself finishes.
-    state = get_daily_state()
-    state["opening_scan_done"] = True
-    save_state(state)
-
-    print(
-        f"OPENING SCAN COMPLETE | "
-        f"opening candidates queued={submitted}"
-    )
-
 
 
 def initialize_order_lifecycle():
@@ -2119,79 +2132,7 @@ def market_loop():
                 wait_with_order_maintenance(300)
                 continue
 
-            current_positions = get_positions()
-
-            for symbol in SYMBOLS:
-                maintain_order_lifecycle()
-                if symbol in current_positions:
-                    continue
-
-                probability, row = get_ml_probability(symbol)
-
-                if probability is None:
-                    continue
-
-                # Intraday entries must use a recent 5-minute bar.
-                # If Alpaca returns stale history, fail closed instead
-                # of placing an order from an old signal.
-                if not is_fresh_intraday_row(symbol, row):
-                    continue
-
-                recent_news, news_change = float(row["news_score"]), 0.0
-
-                trade_score = calculate_trade_score(
-                    probability,
-                    row,
-                    recent_news
-                )
-
-                print(
-                    f"{datetime.now():%H:%M:%S} | "
-                    f"{symbol} | "
-                    f"close={float(row.close):.2f} | "
-                    f"ML={probability:.3f} | "
-                    f"NEWS={recent_news:+.3f} | "
-                    f"SCORE={trade_score:.1f}"
-                )
-
-
-                signal_decision = (
-                    "BUY"
-                    if (
-                        telegram_trading_enabled
-                        and probability >= float(CFG["probability_threshold"])
-                        and trade_score >= float(CFG["trade_score_threshold"])
-                    )
-                    else "NO TRADE"
-                )
-
-                with telegram_lock:
-                    telegram_signals.append({
-                        "time": datetime.now().strftime("%H:%M:%S"),
-                        "symbol": symbol,
-                        "ml": float(probability),
-                        "score": float(trade_score),
-                        "news": float(recent_news),
-                        "decision": signal_decision,
-                    })
-
-                    if len(telegram_signals) > 100:
-                        del telegram_signals[:-100]
-                if (
-                    telegram_trading_enabled
-                    and probability
-                    >= float(CFG["probability_threshold"])
-                    and trade_score
-                    >= float(CFG["trade_score_threshold"])
-                ):
-                    submit_paper_long(
-                        symbol,
-                        float(row.close),
-                        probability,
-                        trade_score,
-                        recent_news,
-                        row,
-                    )
+            run_entry_scan()
 
             # 5-MIN BAR SYNC:
             # Wait until the next exact 5-minute boundary,

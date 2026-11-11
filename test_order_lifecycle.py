@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 from order_journal import OrderJournal, OrderBlocked, SubmissionUnknown, ProcessLock, client_id
 from order_lifecycle import OrderLifecycle, snapshot, exit_state
 from test_paper_boundaries import functions
+from entry_selection import long_trade_plan, valid_opening_selection, SELECTION_POLICY
 
 SESSION = "2026-10-26"
 
@@ -442,12 +443,15 @@ class IntegrationTests(unittest.TestCase):
             broker.submit_order=lambda req: original(req.model_dump(mode="json",exclude_none=True))
             life=OrderLifecycle(journal,broker)
             queue={"A":{"status":"queued","created_at":"2026-10-26T13:00:00+00:00",
-                        "quantity":10,"reference_price":100,"stop_price":98}}
+                        "quantity":10,"reference_price":100,"stop_price":98,
+                        "selection":{"policy":SELECTION_POLICY,"symbols":["A"],
+                                     "scanned_count":1,"complete":True,"rank":1}}}
             (base/"opening_orders.json").write_text(json.dumps(queue))
             def state():
                 attempts=journal.daily_symbols(SESSION)
                 return {"date":SESSION,"trades":len(attempts),"traded_symbols":sorted(attempts)}
             scope=functions("submit_queued_opening_orders", BASE=base,json=json,pd=pd,
+                telegram_trading_enabled=True, SYMBOLS=["A"], valid_opening_selection=valid_opening_selection,
                 get_daily_state=state,daily_loss_reached=lambda _: (False,100000,100000),
                 require_entry_ready=lambda:None,get_positions=lambda:{},has_open_buy_order=lambda _:False,
                 get_latest_trade_price=lambda _:100,CFG={"max_position_pct":.1,"max_trades_per_day":5,"reward_risk_ratio":2},
@@ -478,6 +482,8 @@ class IntegrationTests(unittest.TestCase):
             life=OrderLifecycle(journal,broker)
             saved=Mock()
             scope=functions("submit_paper_long",require_entry_ready=Mock(),
+                long_trade_plan=long_trade_plan, is_fresh_intraday_row=lambda *args:True,
+                telegram_trading_enabled=True,
                 get_daily_state=lambda:{"date":SESSION,"trades":0,"traded_symbols":[]},
                 daily_loss_reached=lambda _: (False,100000,100000),get_positions=lambda:{},
                 get_latest_trade_price=lambda _:100,has_open_buy_order=lambda _:False,
