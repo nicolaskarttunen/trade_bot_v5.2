@@ -4,6 +4,7 @@ import math
 import time
 import pickle
 import threading
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -13,14 +14,24 @@ import websocket
 import requests
 from dotenv import load_dotenv
 
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, TakeProfitRequest, StopLossRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, OrderType
+from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-from features import enrich, FEATURES
+from features import enrich, FEATURES, completed_bars
+from model_pipeline import validate_bundle, latest_signal, trade_score
+from news_features import news_scores
+from alpaca.common.enums import Sort
+from order_journal import OrderJournal, OrderBlocked, ProcessLock
+from order_lifecycle import OrderLifecycle
+from paper_order_adapter import PaperTradingClient, lookup_nested, open_orders, protective_request
+
+ORDER_LIFECYCLE = None
+ORDER_PROCESS_LOCK = None
+ORDER_LAST_MAINTENANCE = 0.0
+ORDER_LAST_ISSUES = []
 
 
 # =====================================================# V5.2 INTEGRATED PAPER TRADER
@@ -33,6 +44,7 @@ CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
 
 with open(BASE / "models" / "ensemble.pkl", "rb") as f:
     MODEL = pickle.load(f)
+validate_bundle(MODEL, CFG, live=True)
 
 API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
@@ -46,7 +58,7 @@ if str(os.getenv("ALPACA_PAPER", "")).lower() != "true":
         "Tämä ohjelma sallii vain Paper Tradingin."
     )
 
-trading = TradingClient(API_KEY, SECRET_KEY, paper=True)
+trading = PaperTradingClient(API_KEY, SECRET_KEY)
 data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
 SYMBOLS = CFG["symbols"]
@@ -136,11 +148,13 @@ def process_news(raw):
         if isinstance(symbols, str):
             symbols = [symbols]
 
-        unique_id = f"{raw.get('id', '')}|{created_at}"
+        unique_id = f"{raw.get('id', '')}|{created_at}|{raw.get('updated_at') or created_at}"
 
         item = {
             "id": unique_id,
             "created_at": str(created_at),
+            "updated_at": str(raw.get("updated_at") or created_at),
+            "received_at": datetime.now(timezone.utc).isoformat(),
             "symbols": list(symbols),
             "headline": headline,
             "summary": summary,
@@ -168,71 +182,14 @@ def process_news(raw):
 
 
 def get_news_signal(symbol):
-    """
-    Returns:
-        recent_score: -1..+1
-        change_score: -1..+1
-
-    Same general scale as the historical news_score feature.
-    """
-
-    now = datetime.now(timezone.utc)
-
-    recent = []
-    previous = []
-
+    """Same receipt-aware feature as training; change is diagnostic only."""
+    now = pd.Timestamp.now(tz="UTC")
     with news_lock:
-        items = list(news_items)
-
-    for item in items:
-        if symbol not in (item.get("symbols") or []):
-            continue
-
-        try:
-            timestamp = pd.Timestamp(
-                item["created_at"]
-            ).tz_convert("UTC").to_pydatetime()
-        except Exception:
-            continue
-
-        age_minutes = (now - timestamp).total_seconds() / 60.0
-
-        if age_minutes < 0 or age_minutes > 360:
-            continue
-
-        weight = math.exp(
-            -age_minutes / max(float(CFG["news_decay_minutes"]), 1.0)
-        )
-
-        value = (
-            float(item.get("sentiment", 0.0))
-            * float(item.get("impact", 1.0))
-            * weight
-        )
-
-        if age_minutes <= 30:
-            recent.append((value, weight))
-        else:
-            previous.append((value, weight))
-
-    def weighted(values):
-        if not values:
-            return 0.0
-
-        numerator = sum(value for value, weight in values)
-        denominator = sum(weight for value, weight in values)
-
-        return numerator / denominator if denominator else 0.0
-
-    recent_score = weighted(recent)
-    previous_score = weighted(previous)
-
-    change = recent_score - previous_score
-
-    return (
-        max(-1.0, min(1.0, recent_score)),
-        max(-1.0, min(1.0, change)),
-    )
+        items = [dict(item) for item in news_items
+                 if symbol in (item.get("symbols") or [])]
+    score = float(news_scores([now], items, CFG["news_decay_minutes"],
+                              CFG["news_lookback_minutes"], require_received=True)[0])
+    return score, 0.0
 
 
 def news_stream_loop():
@@ -339,10 +296,10 @@ def get_bars(symbol, limit=250):
         timeframe=TimeFrame(5, TimeFrameUnit.Minute),
         start=start,
         end=end,
-        # Request enough history that Alpaca cannot truncate us to
-        # the oldest 250 bars in the lookback window. We trim to the
-        # caller-requested number only after sorting by timestamp.
-        limit=max(int(limit), 1000),
+        # Explicit descending request; one extra slot for a forming candle.
+        # Sort ascending and discard incomplete bars before feature calculation.
+        limit=int(limit) + 1,
+        sort=Sort.DESC,
         feed=CFG["feed"],
     )
 
@@ -385,10 +342,10 @@ def get_bars(symbol, limit=250):
 
     # Always return the newest bars, never the oldest bars from the
     # requested lookback window.
-    return clean.tail(int(limit)).reset_index(drop=True)
+    return completed_bars(clean, end).tail(int(limit)).reset_index(drop=True)
 
 
-def is_fresh_intraday_row(symbol, row, max_age_minutes=12.0):
+def is_fresh_intraday_row(symbol, row):
     """Fail closed when an intraday ML signal is based on stale bars."""
     try:
         timestamp = pd.Timestamp(row["timestamp"])
@@ -400,7 +357,8 @@ def is_fresh_intraday_row(symbol, row, max_age_minutes=12.0):
         now_utc = pd.Timestamp.now(tz="UTC")
         age_minutes = (now_utc - timestamp).total_seconds() / 60.0
 
-        if age_minutes < -1.0 or age_minutes > float(max_age_minutes):
+        expected = now_utc.floor("5min") - pd.Timedelta(minutes=5)
+        if timestamp != expected:
             print(
                 f"STALE DATA BLOCK | {symbol} | "
                 f"bar={timestamp.isoformat()} | "
@@ -419,52 +377,21 @@ def is_fresh_intraday_row(symbol, row, max_age_minutes=12.0):
 
 
 def get_benchmark():
-    benchmark = get_bars(BENCHMARK, 250)
-    if benchmark.empty:
-        return benchmark
-    benchmark = enrich(benchmark)
-    return benchmark[['timestamp', 'close', 'atr_pct']].copy()
+    return get_bars(BENCHMARK, 250)
 
 
 def get_ml_probability(symbol):
-    df = get_bars(symbol)
-
-    if len(df) < 60:
-        return None, None
-
+    # Fix the decision time before fetching both inputs. Ignore bars completing
+    # during a long request; the caller's freshness check can then reject it.
+    as_of = pd.Timestamp.now(tz="UTC")
+    df = get_bars(symbol, 250)
     benchmark = get_benchmark()
-
-    recent_news, _ = get_news_signal(symbol)
-
-    enriched = enrich(
-        df,
-        market=benchmark,
-        news=None,
-        news_decay_minutes=CFG["news_decay_minutes"],
-        news_lookback_minutes=CFG["news_lookback_minutes"],
-    )
-
-    # Live news signal is kept on the same -1..1 scale as the
-    # historical news feature used during model training.
-    enriched["news_score"] = recent_news
-
-    enriched = enriched.dropna(subset=FEATURES)
-
-    if enriched.empty:
+    if df.empty or benchmark.empty:
         return None, None
-
-    row = enriched.iloc[-1]
-
-    X = row[FEATURES].to_numpy(dtype=float).reshape(1, -1)
-
-    probabilities = []
-
-    for model in MODEL["models"]:
-        probabilities.append(
-            float(model.predict_proba(X)[:, 1][0])
-        )
-
-    return float(np.mean(probabilities)), row
+    with news_lock:
+        items = [dict(item) for item in news_items
+                 if symbol in (item.get("symbols") or [])]
+    return latest_signal(df, benchmark, items, MODEL, CFG, as_of)
 
 
 # ------------------------------------------------------------
@@ -625,27 +552,45 @@ def telegram_loop():
 # RISK / STATE
 # ------------------------------------------------------------
 
+def atomic_json(path, value):
+    """Replace complete JSON; failure never silently resets risk state."""
+    fd, temporary = tempfile.mkstemp(prefix=path.name+"-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if os.name != "nt":
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def load_state():
     if STATE_FILE.exists():
-        try:
-            return json.loads(
-                STATE_FILE.read_text(encoding="utf-8")
-            )
-        except Exception:
-            pass
-
-    return {
-        "date": None,
-        "start_equity": None,
-        "trades": 0,
-    }
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(state, dict) or "date" not in state or "trades" not in state:
+            raise OrderBlocked("Invalid daily risk state; manual reconciliation required")
+        if (not isinstance(state["trades"], int) or state["trades"] < 0
+                or (state["date"] is not None and
+                    (not math.isfinite(float(state.get("start_equity", 0))) or float(state.get("start_equity", 0)) <= 0))):
+            raise OrderBlocked("Invalid daily equity/trade count")
+        if state["date"] is None and ORDER_LIFECYCLE and ORDER_LIFECYCLE.journal.rows():
+            raise OrderBlocked("Daily baseline missing with journal history")
+        return state
+    if ORDER_LIFECYCLE and ORDER_LIFECYCLE.journal.rows():
+        raise OrderBlocked("Missing daily risk state with journal history")
+    return {"date": None, "start_equity": None, "trades": 0}
 
 
 def save_state(state):
-    STATE_FILE.write_text(
-        json.dumps(state, indent=2),
-        encoding="utf-8"
-    )
+    atomic_json(STATE_FILE, state)
 
 
 def load_notified_order_ids():
@@ -672,7 +617,7 @@ def save_notified_order_ids(order_ids):
 def get_daily_state():
     state = load_state()
 
-    today = datetime.now().date().isoformat()
+    today = pd.Timestamp.now(tz="America/New_York").date().isoformat()
 
     account = trading.get_account()
     equity = float(account.equity)
@@ -688,25 +633,7 @@ def get_daily_state():
 
         save_state(state)
 
-        # New trading day: remove stale OPG tracking entries.
-        # Alpaca itself handles expiration/cancellation of old OPG
-        # orders; this only cleans our local tracking state.
-        opening_file = BASE / "opening_orders.json"
-
-        if opening_file.exists():
-            try:
-                opening_file.write_text(
-                    json.dumps({}, indent=2),
-                    encoding="utf-8",
-                )
-                print(
-                    "OPG STATE CLEANUP | "
-                    "new trading day"
-                )
-            except Exception as exc:
-                print(
-                    f"OPG STATE CLEANUP ERROR | {exc!r}"
-                )
+        # Retain opening history. Stale queued candidates are rejected at send.
 
     if "opening_scan_done" not in state:
         state["opening_scan_done"] = False
@@ -714,6 +641,12 @@ def get_daily_state():
 
     if "traded_symbols" not in state:
         state["traded_symbols"] = []
+        save_state(state)
+
+    if ORDER_LIFECYCLE:
+        attempted = ORDER_LIFECYCLE.journal.daily_symbols(today)
+        state["traded_symbols"] = sorted(set(state["traded_symbols"]) | attempted)
+        state["trades"] = max(int(state["trades"]), len(state["traded_symbols"]))
         save_state(state)
 
     return state
@@ -733,33 +666,33 @@ def daily_loss_reached(state):
 
 
 def get_positions():
+    """Fail closed if Alpaca cannot confirm the actual open positions.
+
+    Returning an empty dict on an API failure could trigger duplicate entries.
+    Callers may catch the exception for display but MUST block new BUY orders.
+    """
     try:
         return {
             position.symbol: position
             for position in trading.get_all_positions()
         }
-    except Exception:
-        return {}
+    except Exception as exc:
+        raise RuntimeError(
+            "POSITION LOOKUP FAILED: entry processing blocked until Alpaca responds"
+        ) from exc
 
 
 def has_open_buy_order(symbol):
     """Return True if an active BUY order already exists for this symbol."""
     try:
         orders = trading.get_orders()
-        active_statuses = {
-            "new",
-            "accepted",
-            "pending_new",
-            "partially_filled",
-            "pending_replace",
-            "accepted_for_bidding",
-        }
+        terminal_statuses = {"filled", "canceled", "expired", "rejected", "replaced"}
 
         for order in orders:
             if (
                 order.symbol == symbol
                 and str(order.side).lower().endswith("buy")
-                and str(order.status).lower() in active_statuses
+                and _enum_text(order.status) not in terminal_statuses
             ):
                 return True
 
@@ -777,14 +710,7 @@ def _enum_text(value):
 
 def _active_buy_orders():
     """Return active BUY orders. Fail closed by raising on API errors."""
-    active_statuses = {
-        "new",
-        "accepted",
-        "pending_new",
-        "partially_filled",
-        "pending_replace",
-        "accepted_for_bidding",
-    }
+    terminal_statuses = {"filled", "canceled", "expired", "rejected", "replaced"}
 
     try:
         orders = trading.get_orders()
@@ -795,7 +721,7 @@ def _active_buy_orders():
         order
         for order in orders
         if _enum_text(order.side) == "buy"
-        and _enum_text(order.status) in active_statuses
+        and _enum_text(order.status) not in terminal_statuses
     ]
 
 
@@ -816,7 +742,7 @@ def get_portfolio_entry_usage(opening_orders=None):
         raise RuntimeError(f"position lookup failed: {exc!r}") from exc
 
     occupied = set(positions)
-    exposure = 0.0
+    by_symbol = {}
 
     for symbol, position in positions.items():
         market_value = float(getattr(position, "market_value", 0) or 0)
@@ -828,7 +754,7 @@ def get_portfolio_entry_usage(opening_orders=None):
                 or 0
             )
             market_value = qty * price
-        exposure += abs(market_value)
+        by_symbol[symbol] = abs(market_value)
 
     active_buy_symbols = set()
 
@@ -855,7 +781,7 @@ def get_portfolio_entry_usage(opening_orders=None):
                 )
             price = float(latest)
 
-        exposure += remaining_qty * price
+        by_symbol[symbol] = by_symbol.get(symbol, 0.) + remaining_qty * price
 
     # Alpaca can take a moment to expose a just-submitted market order.
     # Count submitted opening orders from our own queue as reservations too,
@@ -880,9 +806,14 @@ def get_portfolio_entry_usage(opening_orders=None):
                 )
 
             occupied.add(symbol)
-            exposure += qty * price
+            by_symbol[symbol] = by_symbol.get(symbol, 0.) + qty * price
 
-    return occupied, exposure
+    lifecycle = globals().get("ORDER_LIFECYCLE")
+    if lifecycle:
+        session = pd.Timestamp.now(tz="America/New_York").date().isoformat()
+        by_symbol = lifecycle.reserve_exposure(session, by_symbol)
+        occupied.update(by_symbol)
+    return occupied, sum(by_symbol.values())
 
 
 def enforce_entry_limits(
@@ -988,24 +919,7 @@ def write_trade(
 # ------------------------------------------------------------
 
 def calculate_trade_score(probability, row, news_score):
-    market_return = float(row.get("market_ret_3", 0.0))
-
-    market_component = 1.0 if market_return > 0 else 0.0
-
-    ml_component = max(
-        0.0,
-        min(1.0, (probability - 0.5) / 0.5)
-    )
-
-    news_component = (news_score + 1.0) / 2.0
-
-    score = 100.0 * (
-        float(CFG["ml_weight"]) * ml_component
-        + float(CFG["market_weight"]) * market_component
-        + float(CFG["news_weight"]) * news_component
-    )
-
-    return score
+    return float(trade_score(probability, row["market_ret_3"], news_score, CFG))
 
 
 
@@ -1039,8 +953,8 @@ def submit_opening_order(
             opening_orders = json.loads(
                 opening_file.read_text(encoding="utf-8")
             )
-        except Exception:
-            opening_orders = {}
+        except Exception as exc:
+            raise OrderBlocked("Opening queue is corrupt") from exc
 
     opening_orders[symbol] = {
         "order_id": None,
@@ -1055,10 +969,7 @@ def submit_opening_order(
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    opening_file.write_text(
-        json.dumps(opening_orders, indent=2),
-        encoding="utf-8",
-    )
+    atomic_json(opening_file, opening_orders)
 
     print(
         f"OPENING QUEUED | {symbol} x{quantity} | "
@@ -1075,6 +986,7 @@ def submit_opening_order(
 
 
 def submit_paper_long(symbol, reference_price, probability, score, news_score, row, opening=False):
+    require_entry_ready(allow_queue=opening)
     state = get_daily_state()
 
     # ONE TRADE PER SYMBOL PER DAY
@@ -1188,8 +1100,7 @@ def submit_paper_long(symbol, reference_price, probability, score, news_score, r
         if order is None:
             return
 
-        # Do not count an OPG submission as a trade yet.
-        # It is counted only after the opening-auction BUY actually fills.
+        # Queuing is not submission. A durable send attempt consumes the daily slot.
 
         reason = (
             f"OPG; "
@@ -1239,7 +1150,13 @@ def submit_paper_long(symbol, reference_price, probability, score, news_score, r
         return
 
     print(f"ORDER DEBUG | {symbol} | ref={reference_price:.4f} | ATR={float(row['atr']):.4f} | stop_dist={stop_distance:.4f} | SL={stop_price:.2f} | TP={target_price:.2f}")
-    order = trading.submit_order(order_request)
+    def request_factory(cid):
+        order_request.client_order_id = cid
+        return order_request
+    require_entry_ready()
+    order = ORDER_LIFECYCLE.submit_once(state["date"], symbol, "entry", request_factory,
+        reference_price, {"mode": "intraday", "stop_distance": stop_distance,
+                          "reward_risk_ratio": float(CFG["reward_risk_ratio"])})
 
     state["trades"] += 1
     traded_symbols = state.setdefault("traded_symbols", [])
@@ -1304,7 +1221,7 @@ def _send_eod_critical_once(message):
 
 def flatten_end_of_day(seconds_to_close=None):
     """
-    Repeated-safe end-of-day flatten.
+    Legacy bulk end-of-day flatten (ambiguous acknowledgements still unhandled).
 
     Uses a strict Alpaca position lookup so API failures never look like an
     empty portfolio. The market loop calls this repeatedly during the last
@@ -1325,7 +1242,17 @@ def flatten_end_of_day(seconds_to_close=None):
         return False
 
     if not positions:
-        print("EOD VERIFIED | portfolio flat")
+        try:
+            trading.cancel_orders()
+            remaining_orders = trading.get_orders()
+            remaining_positions = trading.get_all_positions()
+        except Exception as exc:
+            print("EOD FLAT VERIFY ERROR:", repr(exc))
+            return False
+        if remaining_orders or remaining_positions:
+            print("EOD RETRY | pending orders or newly filled positions remain")
+            return False
+        print("EOD VERIFIED | no positions or open orders")
         return True
 
     symbols = [str(position.symbol) for position in positions]
@@ -1338,8 +1265,8 @@ def flatten_end_of_day(seconds_to_close=None):
 
     try:
         # Cancel bracket/OCO exits and submit market closes for every
-        # remaining position. This is safe to call again if verification
-        # shows that a position did not close on the first attempt.
+        # remaining position. TODO: journal close intents before this RPC.
+        # A timeout followed by a retry is NOT proven safe; deployment blocker.
         trading.close_all_positions(cancel_orders=True)
     except Exception as exc:
         print("EOD CLOSE ERROR:", repr(exc))
@@ -1371,7 +1298,14 @@ def flatten_end_of_day(seconds_to_close=None):
         return False
 
     if not remaining:
-        print("EOD VERIFIED | all paper positions closed")
+        try:
+            if trading.get_orders():
+                print("EOD RETRY | open orders remain after position close")
+                return False
+        except Exception as exc:
+            print("EOD ORDER VERIFY ERROR:", repr(exc))
+            return False
+        print("EOD VERIFIED | all paper positions and orders closed")
         return True
 
     remaining_symbols = [str(position.symbol) for position in remaining]
@@ -1544,6 +1478,15 @@ def submit_queued_opening_orders():
         if data.get("status") != "queued":
             continue
 
+        require_entry_ready()
+        state = get_daily_state()
+        created = pd.Timestamp(data["created_at"])
+        if created.tzinfo is None or created.tz_convert("America/New_York").date().isoformat() != state["date"]:
+            print(f"STALE OPENING QUEUE | {symbol} | rejected")
+            continue
+        if symbol in state["traded_symbols"] or state["trades"] >= int(CFG["max_trades_per_day"]):
+            continue
+
         if symbol in get_positions() or has_open_buy_order(symbol):
             print(
                 f"OPENING MARKET BLOCKED | {symbol} | "
@@ -1617,7 +1560,13 @@ def submit_queued_opening_orders():
         )
 
         try:
-            order = trading.submit_order(order_request)
+            def request_factory(cid):
+                order_request.client_order_id = cid
+                return order_request
+            order = ORDER_LIFECYCLE.submit_once(state["date"], symbol, "entry", request_factory,
+                latest_price, {"mode": "opening",
+                    "stop_distance": float(data["reference_price"])-float(data["stop_price"]),
+                    "reward_risk_ratio": float(CFG["reward_risk_ratio"])})
         except Exception as exc:
             print(
                 f"OPENING MARKET ERROR | {symbol} | {exc!r}"
@@ -1634,6 +1583,8 @@ def submit_queued_opening_orders():
 
         opening_orders[symbol] = data
         changed = True
+        atomic_json(opening_file, opening_orders)
+        get_daily_state()
 
         print(
             f"OPENING MARKET BUY | PAPER {symbol} x{quantity} | "
@@ -1641,67 +1592,7 @@ def submit_queued_opening_orders():
         )
 
     if changed:
-        opening_file.write_text(
-            json.dumps(opening_orders, indent=2),
-            encoding="utf-8",
-        )
-
-
-
-def submit_opening_oco(symbol, quantity, stop_price, target_price):
-    """Attach TP + SL to a position created by an OPG entry."""
-
-    try:
-        # Alpaca OCO orders are exit orders for an already-open position.
-        # Use the actual filled quantity and the previously calculated
-        # protection levels.
-        stop_price = float(stop_price)
-        target_price = float(target_price)
-        quantity = float(quantity)
-
-        if quantity <= 0:
-            raise ValueError(
-                f"invalid OCO quantity: {quantity}"
-            )
-
-        if stop_price >= target_price:
-            raise ValueError(
-                f"invalid OCO prices: SL={stop_price} "
-                f"TP={target_price}"
-            )
-
-        oco_request = LimitOrderRequest(
-            symbol=symbol,
-            qty=quantity,
-            side=OrderSide.SELL,
-            type=OrderType.LIMIT,
-            time_in_force=TimeInForce.GTC,
-            order_class=OrderClass.OCO,
-            take_profit=TakeProfitRequest(
-                limit_price=target_price
-            ),
-            stop_loss=StopLossRequest(
-                stop_price=stop_price
-            ),
-        )
-
-        order = trading.submit_order(oco_request)
-
-        print(
-            f"OPG OCO | {symbol} | "
-            f"qty={quantity:g} | "
-            f"SL={stop_price:.2f} | "
-            f"TP={target_price:.2f} | "
-            f"order_id={order.id}"
-        )
-
-        return order
-
-    except Exception as exc:
-        print(
-            f"OPG OCO ERROR | {symbol} | {exc!r}"
-        )
-        return None
+        atomic_json(opening_file, opening_orders)
 
 
 
@@ -1744,9 +1635,9 @@ def check_filled_orders():
             if order_id in notified_order_ids:
                 continue
 
-            status = str(order.status).lower()
+            status = _enum_text(order.status)
 
-            if "filled" not in status:
+            if status != "filled":
                 continue
             filled_at = getattr(order, "filled_at", None)
 
@@ -1771,209 +1662,6 @@ def check_filled_orders():
             side = str(order.side).lower()
 
             if "buy" in side:
-                # Check whether this BUY was one of our opening-auction
-                # (OPG) entries. Normal bracket BUYs continue unchanged.
-                opening_file = BASE / "opening_orders.json"
-                opening_orders = {}
-                opening_data = None
-
-                if opening_file.exists():
-                    try:
-                        opening_orders = json.loads(
-                            opening_file.read_text(encoding="utf-8")
-                        )
-
-                        candidate = opening_orders.get(
-                            str(order.symbol)
-                        )
-
-                        if (
-                            candidate
-                            and str(candidate.get("order_id"))
-                            == order_id
-                        ):
-                            opening_data = candidate
-
-                    except Exception as exc:
-                        print(
-                            f"OPG STATE ERROR | "
-                            f"{order.symbol} | {exc!r}"
-                        )
-
-                if opening_data is not None:
-                    filled_qty = float(
-                        getattr(order, "filled_qty", 0) or 0
-                    )
-                    fill_price = float(
-                        getattr(
-                            order,
-                            "filled_avg_price",
-                            0,
-                        ) or 0
-                    )
-
-                    if filled_qty <= 0 or fill_price <= 0:
-                        print(
-                            f"OPG FILL DATA ERROR | "
-                            f"{order.symbol} | "
-                            f"qty={filled_qty} | "
-                            f"price={fill_price}"
-                        )
-                        continue
-
-                    # Preserve the originally calculated risk distance,
-                    # but anchor SL/TP to the actual auction fill price.
-                    planned_reference = float(
-                        opening_data["reference_price"]
-                    )
-                    planned_stop = float(
-                        opening_data["stop_price"]
-                    )
-
-                    stop_distance = (
-                        planned_reference - planned_stop
-                    )
-
-                    if stop_distance <= 0:
-                        print(
-                            f"OPG RISK ERROR | "
-                            f"{order.symbol} | "
-                            f"distance={stop_distance}"
-                        )
-                        continue
-
-                    actual_stop = round(
-                        fill_price - stop_distance,
-                        2,
-                    )
-                    actual_target = round(
-                        fill_price
-                        + stop_distance
-                        * float(CFG["reward_risk_ratio"]),
-                        2,
-                    )
-
-                    print(
-                        f"OPG FILLED | {order.symbol} | "
-                        f"qty={filled_qty:g} | "
-                        f"fill={fill_price:.2f} | "
-                        f"SL={actual_stop:.2f} | "
-                        f"TP={actual_target:.2f}"
-                    )
-
-                    oco_order = submit_opening_oco(
-                        symbol=str(order.symbol),
-                        quantity=filled_qty,
-                        stop_price=actual_stop,
-                        target_price=actual_target,
-                    )
-
-                    if oco_order is None:
-                        # Persist retry count so a process restart cannot
-                        # reset the protection failure counter.
-                        retry_count = int(
-                            opening_data.get(
-                                "protection_retries",
-                                0,
-                            )
-                        ) + 1
-
-                        opening_data[
-                            "protection_retries"
-                        ] = retry_count
-
-                        opening_orders[
-                            str(order.symbol)
-                        ] = opening_data
-
-                        opening_file.write_text(
-                            json.dumps(
-                                opening_orders,
-                                indent=2,
-                            ),
-                            encoding="utf-8",
-                        )
-
-                        print(
-                            f"OPG PROTECTION PENDING | "
-                            f"{order.symbol} | "
-                            f"retry={retry_count}/3"
-                        )
-
-                        if retry_count >= 3:
-                            print(
-                                f"OPG FAIL-SAFE | "
-                                f"{order.symbol} | "
-                                f"OCO protection failed 3 times | "
-                                f"closing position"
-                            )
-
-                            try:
-                                trading.close_position(
-                                    str(order.symbol)
-                                )
-
-                                # The emergency close request was accepted.
-                                # Remove the OPG protection state so we do
-                                # not keep submitting OCO orders as well.
-                                opening_orders.pop(
-                                    str(order.symbol),
-                                    None,
-                                )
-
-                                opening_file.write_text(
-                                    json.dumps(
-                                        opening_orders,
-                                        indent=2,
-                                    ),
-                                    encoding="utf-8",
-                                )
-
-                                print(
-                                    f"OPG FAIL-SAFE CLOSE | "
-                                    f"{order.symbol} | "
-                                    f"close request submitted"
-                                )
-
-                            except Exception as close_exc:
-                                print(
-                                    f"OPG FAIL-SAFE CLOSE ERROR | "
-                                    f"{order.symbol} | "
-                                    f"{close_exc!r}"
-                                )
-
-                        continue
-
-                    # Remove only after OCO protection exists.
-                    opening_orders.pop(
-                        str(order.symbol),
-                        None,
-                    )
-
-                    opening_file.write_text(
-                        json.dumps(
-                            opening_orders,
-                            indent=2,
-                        ),
-                        encoding="utf-8",
-                    )
-
-                    # Count the trade only after the OPG BUY has
-                    # actually filled and OCO protection is active.
-                    state = get_daily_state()
-                    state["trades"] += 1
-                    traded_symbols = state.setdefault("traded_symbols", [])
-                    filled_symbol = str(order.symbol)
-                    if filled_symbol not in traded_symbols:
-                        traded_symbols.append(filled_symbol)
-                    save_state(state)
-
-                    print(
-                        f"OPG PROTECTED | "
-                        f"{order.symbol} | OCO active | "
-                        f"daily_trades={state['trades']}"
-                    )
-
                 sent = _send_buy_fill_notification(order)
 
             elif "sell" in side:
@@ -2102,7 +1790,7 @@ def run_opening_scan():
         if probability is None:
             continue
 
-        recent_news, news_change = get_news_signal(symbol)
+        recent_news, news_change = float(row["news_score"]), 0.0
 
         trade_score = calculate_trade_score(
             probability,
@@ -2206,6 +1894,76 @@ def run_opening_scan():
 
 
 
+def initialize_order_lifecycle():
+    global ORDER_LIFECYCLE, ORDER_PROCESS_LOCK
+    ORDER_PROCESS_LOCK = ProcessLock(BASE / "paper_order_writer.lock")
+    account = trading.get_account()
+    journal = OrderJournal(BASE / "paper_order_intents.sqlite3", account.id)
+    ORDER_LIFECYCLE = OrderLifecycle(journal, trading,
+        lookup=lambda cid: lookup_nested(trading, cid, journal.get(cid)["broker_id"]),
+        open_orders=lambda: open_orders(trading))
+    # Do not adopt legacy positions or submitted queue records automatically.
+    queue_path = BASE / "opening_orders.json"
+    queue = json.loads(queue_path.read_text()) if queue_path.exists() else {}
+    known = {r["broker_id"] for r in journal.rows()}
+    if any(d.get("status") == "submitted" and d.get("order_id") not in known for d in queue.values()):
+        raise OrderBlocked("Legacy submitted queue requires manual reconciliation")
+    if not journal.rows() and (trading.get_all_positions() or open_orders(trading)):
+        raise OrderBlocked("A fresh journal requires an empty, dedicated paper account")
+    get_daily_state()  # Persist daily baseline BEFORE any new intent.
+    ORDER_LIFECYCLE.reconcile()
+    blockers = ORDER_LIFECYCLE.entry_blockers(pd.Timestamp.now(tz="America/New_York").date().isoformat())
+    if blockers:
+        print("STARTUP ORDER BLOCKERS | " + "; ".join(blockers))
+
+
+def maintain_order_lifecycle(force=False):
+    global ORDER_LAST_MAINTENANCE, ORDER_LAST_ISSUES
+    if ORDER_LIFECYCLE is None:
+        raise OrderBlocked("Order lifecycle was not initialized")
+    # Cap background polling; every new entry forces a fresh reconciliation.
+    if not force and time.monotonic()-ORDER_LAST_MAINTENANCE < 5:
+        return list(ORDER_LAST_ISSUES)
+    ORDER_LIFECYCLE.reconcile()
+    clock = trading.get_clock()
+    remaining = (pd.Timestamp(clock.next_close)-pd.Timestamp.now(tz="UTC")).total_seconds()
+    issues = []
+    # EOD control retains priority; do not create exits during flattening.
+    if clock.is_open and remaining > 600:
+        issues += ORDER_LIFECYCLE.maintain_opening_protection(protective_request)
+    session = pd.Timestamp.now(tz="America/New_York").date().isoformat()
+    issues += ORDER_LIFECYCLE.entry_blockers(session)
+    ORDER_LAST_ISSUES = list(issues)
+    ORDER_LAST_MAINTENANCE = time.monotonic()
+    return issues
+
+
+def require_entry_ready(allow_queue=False):
+    blockers = list(maintain_order_lifecycle(force=True))
+    clock = trading.get_clock()
+    remaining = (pd.Timestamp(clock.next_close)-pd.Timestamp.now(tz="UTC")).total_seconds()
+    if not allow_queue and (not clock.is_open or remaining <= 600):
+        blockers.append("Market closed or EOD window; no new entry")
+    if blockers:
+        raise OrderBlocked("New BUY blocked: " + "; ".join(blockers))
+
+
+def wait_with_order_maintenance(seconds):
+    deadline = time.monotonic()+seconds
+    while time.monotonic() < deadline:
+        try:
+            issues = maintain_order_lifecycle()
+            if issues:
+                print("ORDER MAINTENANCE | " + "; ".join(issues))
+            clock = trading.get_clock()
+            # Return control to the main loop when the EOD window begins.
+            if clock.is_open and (pd.Timestamp(clock.next_close)-pd.Timestamp.now(tz="UTC")).total_seconds() <= 600:
+                return
+        except Exception as exc:
+            print("ORDER MAINTENANCE ERROR |", repr(exc))
+        time.sleep(min(5., max(0., deadline-time.monotonic())))
+
+
 def market_loop():
     print()
     print("=" * 65)
@@ -2292,6 +2050,7 @@ def market_loop():
                 # Candidates were selected before the open.
                 # Send them as market BUYs once Alpaca reports
                 # the regular session as open.
+                maintain_order_lifecycle()
                 submit_queued_opening_orders()
                 check_filled_orders()
 
@@ -2303,9 +2062,10 @@ def market_loop():
                         f"OPENING PROTECTION WINDOW | "
                         f"checking fills"
                     )
-                    time.sleep(2)
+                    wait_with_order_maintenance(2)
                     continue
 
+            maintain_order_lifecycle()
             check_filled_orders()
 
             state = get_daily_state()
@@ -2319,7 +2079,7 @@ def market_loop():
                     f"equity={equity:.2f} | "
                     f"start={start_equity:.2f}"
                 )
-                time.sleep(300)
+                wait_with_order_maintenance(300)
                 continue
 
             # After the opening-auction phase, allow fresh intraday
@@ -2346,7 +2106,7 @@ def market_loop():
                     f"{datetime.now():%H:%M:%S} | "
                     f"INTRADAY | outside entry window"
                 )
-                time.sleep(60)
+                wait_with_order_maintenance(60)
                 continue
 
             # Avoid scanning the whole universe once the daily trade
@@ -2356,12 +2116,13 @@ def market_loop():
                     f"{datetime.now():%H:%M:%S} | "
                     f"INTRADAY | daily trade limit reached"
                 )
-                time.sleep(300)
+                wait_with_order_maintenance(300)
                 continue
 
             current_positions = get_positions()
 
             for symbol in SYMBOLS:
+                maintain_order_lifecycle()
                 if symbol in current_positions:
                     continue
 
@@ -2376,7 +2137,7 @@ def market_loop():
                 if not is_fresh_intraday_row(symbol, row):
                     continue
 
-                recent_news, news_change = get_news_signal(symbol)
+                recent_news, news_change = float(row["news_score"]), 0.0
 
                 trade_score = calculate_trade_score(
                     probability,
@@ -2451,7 +2212,7 @@ def market_loop():
                 f"{sleep_seconds:.1f}s"
             )
 
-            time.sleep(sleep_seconds)
+            wait_with_order_maintenance(sleep_seconds)
 
         except KeyboardInterrupt:
             print()
@@ -2463,10 +2224,11 @@ def market_loop():
                 "RUNNER ERROR:",
                 repr(exc)
             )
-            time.sleep(30)
+            wait_with_order_maintenance(30)
 
 
 if __name__ == "__main__":
+    initialize_order_lifecycle()
     news_items = load_news_history()
 
     news_thread = threading.Thread(

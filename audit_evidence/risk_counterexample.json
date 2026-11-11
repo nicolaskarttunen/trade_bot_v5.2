@@ -1,0 +1,14 @@
+{
+  "fixture": "synthetic; initial equity 100000, reference 100, 5 bps each side, position cap 10%",
+  "results": {
+    "before": {
+      "qty": 100,
+      "entry_value": 10005.0
+    },
+    "after": {
+      "qty": 99,
+      "entry_value": 9904.949999999999
+    }
+  },
+  "profitability_evidence": false
+}
