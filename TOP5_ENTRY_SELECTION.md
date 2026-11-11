@@ -13,8 +13,9 @@ Opening selection and intraday selection both use this process.
    momentum, RSI, relative volume and the receipt-aware news feature. The model
    already consumes the technical features. The review records them explicitly.
 4. Calculate each candidate's share count, stop, target and conditional dollar
-   outcomes using the paper process's existing risk settings. Modeled slippage,
-   spread and commission are charged on both sides. A target scenario must cover
+   outcomes using the paper process's existing risk settings. Modeled slippage
+   and spread apply on both sides. The fixed commission is charged once for the
+   round trip, matching the replay cost contract. A target scenario must cover
    those costs. Review all five before attempting the first order.
 5. Recheck price, position/exposure limits, daily risk, pause state and freshness
    at submission. Recalculate the reported plan for the actual allowed quantity.

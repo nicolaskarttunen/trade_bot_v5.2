@@ -32,8 +32,9 @@ class TradePlanTests(unittest.TestCase):
         self.assertEqual(plan["quantity"], 100)
         self.assertEqual(plan["stop_price"], 97)
         self.assertEqual(plan["target_price"], 106)
-        self.assertAlmostEqual(plan["target_net_pnl_usd"], 587.7)
-        self.assertAlmostEqual(plan["stop_net_pnl_usd"], -311.85)
+        self.assertAlmostEqual(plan["target_net_pnl_usd"], 588.7)
+        self.assertAlmostEqual(plan["stop_net_pnl_usd"], -310.85)
+        self.assertEqual(plan["commission_round_trip_usd"], 1)
         self.assertIsNone(plan["expected_pnl_usd"])
 
     def test_atr_floor_and_portfolio_cap_apply_to_scenarios(self):

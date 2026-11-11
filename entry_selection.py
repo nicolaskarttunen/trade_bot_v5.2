@@ -73,8 +73,9 @@ Gap losses, partial fills and end-of-day exits can have different outcomes.
     if quantity_cap is not None:
         quantity = min(quantity, max(0, int(quantity_cap)))
     entry_cost = price * quantity * cost_fraction
-    target_cost = entry_cost + target * quantity * cost_fraction + 2 * commission
-    stop_cost = entry_cost + stop * quantity * cost_fraction + 2 * commission
+    # Match intraday_replay: commission_per_trade is one round-trip fee.
+    target_cost = entry_cost + target * quantity * cost_fraction + commission
+    stop_cost = entry_cost + stop * quantity * cost_fraction + commission
     if quantity == 0:
         target_cost = stop_cost = 0.0
     target_net = quantity * (target - price) - target_cost
@@ -95,7 +96,7 @@ Gap losses, partial fills and end-of-day exits can have different outcomes.
         "stop_modeled_cost_usd": stop_cost,
         "slippage_bps_per_side": slippage,
         "spread_bps_per_side": spread,
-        "commission_per_side_usd": commission,
+        "commission_round_trip_usd": commission,
         "expected_pnl_usd": None,
         "outcome_basis": "conditional_target_or_stop_with_modeled_costs",
     }
