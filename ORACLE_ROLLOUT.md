@@ -145,7 +145,7 @@ cd "$stage"
 The check verifies config/source/environment and all recorded data, matrix and
 model hashes, validates the model and repeats each stock's saved prediction
 probe. It acquires the existing preparation lock without creating files or
-starting training. It then uses only the verified same-user running service's
+starting training. It then resolves the verified same-user running service's
 Alpaca credential pair for GETs to the fixed **paper** account, positions and
 nested open-orders endpoints. It never constructs a trading client, imports the
 trading process, prints credentials, creates a journal or changes broker/local
@@ -159,10 +159,23 @@ continues running during this inspection, so its observations do not replace
 the consistent backup, fresh reconciliation or first-scan verification at the
 actual switch. A service PID/state change during the check stops it.
 
-The command requires the original service to still expose a verifiable same-user
-credential pair. It deliberately does not silently fall back to a different
-environment/file pair and thereby inspect a different paper account. If access
-is unavailable, inspect the running account on the host; never export keys.
+The command verifies the running PID's user, source argument and working
+directory before reading selected startup environment keys. A complete initial
+pair takes precedence. The legacy bot also calls `load_dotenv(".env.v5")` after
+process creation; those later-added keys need not appear in `/proc/PID/environ`.
+When neither initial key is present, the check supports that exact literal
+startup load from the verified service directory. Both source and dotenv file
+mtime/ctime must predate process startup, derived from Linux boot/start ticks.
+The dotenv pair must be complete and literal; changed files, disabled loading,
+interpolation, partial initial pairs, different working directories and
+unreadable process metadata stop the check for local account confirmation.
+`credential_source` reports only the selected source type, never values.
+Timestamp checks are consistency evidence, not an authenticated historical
+snapshot; the account still needs reconciliation at cutover.
+
+The invoking shell's own keys, generic `.env` files and other accounts are not
+fallback sources for this check. If startup inputs have changed or access is
+unavailable, inspect the running account on the host; never export keys.
 
 ## Verify selection and pre-open behavior
 

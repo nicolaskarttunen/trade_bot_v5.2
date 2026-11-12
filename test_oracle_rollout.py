@@ -1,11 +1,12 @@
 """Read-only Oracle inspection tests: fake broker data and blocked sockets."""
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 import io
 import json
 import os
 from pathlib import Path
 import sqlite3
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -48,11 +49,12 @@ class StateTests(unittest.TestCase):
 
     def test_journal_is_read_only_and_account_binding_and_unknown_intents_are_reported(self):
         dbpath = self.source / "paper_order_intents.sqlite3"
-        with sqlite3.connect(dbpath) as db:
+        with closing(sqlite3.connect(dbpath)) as db:
             db.executescript("CREATE TABLE metadata(key TEXT,value TEXT);"
                 "INSERT INTO metadata VALUES('schema_version','1'),('account_id','different-id');"
                 "CREATE TABLE intents(broker_id TEXT,state TEXT);"
                 "INSERT INTO intents VALUES('known-order','unknown');")
+            db.commit()
         before = dbpath.read_bytes()
         report = check.account_state(self.source, empty_broker())
         self.assertFalse(report["journal"]["account_matches"])
@@ -68,9 +70,10 @@ class StateTests(unittest.TestCase):
         with self.assertRaisesRegex(check.CheckError, "queue"):
             check.account_state(self.source, empty_broker())
         (self.source / "opening_orders.json").unlink()
-        with sqlite3.connect(self.source / "paper_order_intents.sqlite3") as db:
+        with closing(sqlite3.connect(self.source / "paper_order_intents.sqlite3")) as db:
             db.executescript("CREATE TABLE metadata(key TEXT,value TEXT);"
                              "INSERT INTO metadata VALUES('schema_version','unsupported');")
+            db.commit()
         with self.assertRaisesRegex(check.CheckError, "schema"):
             check.account_state(self.source, empty_broker())
 
@@ -100,6 +103,67 @@ class StateTests(unittest.TestCase):
         with patch.object(requests, "Session", return_value=session), self.assertRaises(check.CheckError) as caught:
             check.paper_gets(("fake-key", "fake-secret"))
         self.assertNotIn("fake-secret", str(caught.exception))
+
+
+class StartupCredentialTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.source = Path(self.tmp.name).resolve()
+        (self.source / "paper_trader_integrated.py").write_text('load_dotenv(".env.v5")\n')
+        (self.source / ".env.v5").write_text("ALPACA_API_KEY=file-key\nALPACA_SECRET_KEY=file-secret\n")
+
+    def test_startup_dotenv_pair_is_resolved_without_using_callers_environment_or_writing_files(self):
+        before = {p.name: p.read_bytes() for p in self.source.iterdir()}
+        with patch.object(check, "service_startup", return_value=({}, time.time() + 2)), \
+                patch.dict(os.environ, {"ALPACA_API_KEY": "other-key", "ALPACA_SECRET_KEY": "other-secret"}):
+            pair, origin = check.running_service_pair(self.source, {})
+        self.assertEqual(pair, ("file-key", "file-secret"))
+        self.assertEqual(origin, "verified_service_startup_dotenv_file")
+        self.assertEqual(before, {p.name: p.read_bytes() for p in self.source.iterdir()})
+
+    def test_initial_service_pair_takes_precedence_and_partial_pairs_never_mix(self):
+        values = dict(ALPACA_API_KEY="startup-key", ALPACA_SECRET_KEY="startup-secret")
+        with patch.object(check, "service_startup", return_value=(values, 0)):
+            pair, origin = check.running_service_pair(self.source, {})
+        self.assertEqual(pair, ("startup-key", "startup-secret"))
+        self.assertEqual(origin, "verified_service_initial_environment")
+        for values in ({"ALPACA_API_KEY": "only-key"}, {"ALPACA_API_KEY": ""}):
+            with patch.object(check, "service_startup", return_value=(values, time.time() + 2)), \
+                    self.assertRaisesRegex(check.CheckError, "mixing sources"):
+                check.running_service_pair(self.source, {})
+
+    def test_changed_startup_files_interpolation_and_unsupported_loads_stop(self):
+        with patch.object(check, "service_startup", return_value=({"PYTHON_DOTENV_DISABLED": "true"}, time.time() + 2)), \
+                self.assertRaisesRegex(check.CheckError, "disabled at startup"):
+            check.running_service_pair(self.source, {})
+        with patch.object(check, "service_startup", return_value=({}, 0)), \
+                self.assertRaisesRegex(check.CheckError, "changed since startup"):
+            check.running_service_pair(self.source, {})
+        (self.source / ".env.v5").write_text("ALPACA_API_KEY=${OTHER}\nALPACA_SECRET_KEY=file-secret\n")
+        with patch.object(check, "service_startup", return_value=({}, time.time() + 2)), \
+                self.assertRaisesRegex(check.CheckError, "literal credential pair"):
+            check.running_service_pair(self.source, {})
+        (self.source / "paper_trader_integrated.py").write_text('load_dotenv("different-file")\n')
+        with patch.object(check, "service_startup", return_value=({}, time.time() + 2)), \
+                self.assertRaisesRegex(check.CheckError, "supported literal"):
+            check.running_service_pair(self.source, {})
+
+    @unittest.skipUnless(os.name == "posix", "Oracle verifies Linux process ownership and /proc")
+    def test_process_identity_and_selected_initial_keys_are_verified(self):
+        proc = self.source / "fake-proc"; process = proc / "123"
+        process.mkdir(parents=True)
+        (process / "cmdline").write_bytes(os.fsencode(str(self.source / "paper_trader_integrated.py")) + b"\0")
+        (process / "cwd").symlink_to(self.source, target_is_directory=True)
+        (process / "environ").write_bytes(b"ALPACA_API_KEY=key\0ALPACA_SECRET_KEY=secret\0UNRELATED=never-export\0")
+        (process / "stat").write_text("123 (python with spaces) " + " ".join(["0"] * 19 + [str(os.sysconf("SC_CLK_TCK") * 25)]))
+        (proc / "stat").write_text("btime 1000\n")
+        values, started = check.service_startup(self.source, dict(ActiveState="active", MainPID="123"), proc)
+        self.assertEqual(values, {"ALPACA_API_KEY": "key", "ALPACA_SECRET_KEY": "secret"})
+        self.assertEqual(started, 1025)
+        (process / "cmdline").write_bytes(b"unrelated_process\0")
+        with self.assertRaisesRegex(check.CheckError, "expected source file"):
+            check.service_startup(self.source, dict(ActiveState="active", MainPID="123"), proc)
 
 
 @unittest.skipUnless(os.name == "posix", "Oracle existing preparation lock uses flock")
@@ -172,9 +236,9 @@ class CandidateTests(unittest.TestCase):
 
     def test_no_unverified_credential_fallback_or_exception_secret_output(self):
         with patch.object(check, "service_info", return_value=dict(MainPID="1")), \
-                patch.object(self.candidate, "service_credentials", return_value=None), \
+                patch.object(check, "running_service_pair", side_effect=check.CheckError("Startup sources unavailable")), \
                 patch.object(check, "paper_gets", side_effect=AssertionError("Credentials unverified")):
-            with self.assertRaisesRegex(check.CheckError, "credentials unavailable"):
+            with self.assertRaisesRegex(check.CheckError, "Startup sources unavailable"):
                 check.inspect(self.source, self.output)
         output = io.StringIO()
         with patch.object(check, "inspect", side_effect=RuntimeError("fake-secret")), \
