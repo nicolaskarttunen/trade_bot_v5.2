@@ -24,7 +24,10 @@ selection or independently verify corporate actions.
 
 Credentials come from the process environment or one complete pair in the
 source `.env.v5`, source `.env`, or `/etc/v52-paper-bot.env`. They are never
-written into reports. Only the historical market-data endpoint is contacted.
+written into reports. If those are unavailable, the existing same-user bot
+process is verified by its source path and only its Alpaca pair is read from
+its initial environment. No privileges, keys or access policies are added.
+Only the historical market-data endpoint is contacted.
 Authentication/subscription errors stop the job; it never upgrades a plan or
 switches feeds. Transient GET failures have bounded retries.
 

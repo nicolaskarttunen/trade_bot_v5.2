@@ -17,6 +17,7 @@ import pickle
 import platform
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -113,6 +114,30 @@ def protocol(cfg):
                 alpaca_py=version("alpaca-py"))
 
 
+def service_credentials(source):
+    """Read only the existing same-user bot's pair; never export its environment."""
+    try:
+        pid = int(subprocess.check_output(["systemctl", "show", "v52-paper-bot.service",
+                  "-p", "MainPID", "--value"], text=True, stderr=subprocess.DEVNULL).strip())
+        if pid <= 0:
+            return None
+        process = Path("/proc") / str(pid)
+        if process.stat().st_uid != os.geteuid():
+            return None
+        arguments = (process / "cmdline").read_bytes().split(b"\0")
+        if os.fsencode(str(source / "paper_trader_integrated.py")) not in arguments:
+            return None
+        values = {}
+        for entry in (process / "environ").read_bytes().split(b"\0"):
+            name, _, value = entry.partition(b"=")
+            if name in {b"ALPACA_API_KEY", b"ALPACA_SECRET_KEY"}:
+                values[os.fsdecode(name)] = os.fsdecode(value)
+        key, secret = values.get("ALPACA_API_KEY"), values.get("ALPACA_SECRET_KEY")
+        return (key, secret) if key and secret else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
 def credentials(source):
     key, secret = os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_SECRET_KEY")
     for path in (source / ".env.v5", source / ".env", Path("/etc/v52-paper-bot.env")):
@@ -126,6 +151,9 @@ def credentials(source):
         if values.get("ALPACA_API_KEY") and values.get("ALPACA_SECRET_KEY"):
             key, secret = values["ALPACA_API_KEY"], values["ALPACA_SECRET_KEY"]
     if not key or not secret:
+        existing = service_credentials(source)
+        if existing:
+            return existing
         raise CandidateError("Market-data credentials unavailable on server")
     return key, secret
 

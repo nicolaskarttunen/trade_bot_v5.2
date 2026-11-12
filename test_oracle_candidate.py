@@ -73,9 +73,26 @@ class DownloadTests(unittest.TestCase):
         def values(path, **kwargs):
             return {"ALPACA_API_KEY": "one"} if path.name == ".env.v5" else {"ALPACA_SECRET_KEY": "two"}
         with patch.dict(os.environ, {}, clear=True), patch.object(Path, "is_file", return_value=True), \
-                patch.object(candidate, "dotenv_values", side_effect=values):
+                patch.object(candidate, "dotenv_values", side_effect=values), \
+                patch.object(candidate, "service_credentials", return_value=None):
             with self.assertRaisesRegex(ValueError, "unavailable"):
                 candidate.credentials(Path("/unused"))
+
+    @unittest.skipUnless(os.name == "posix", "Oracle reads the same-user Linux process")
+    def test_service_credentials_require_expected_process_and_select_only_the_pair(self):
+        source, reads = Path("/running-bot"), []
+        def read(path):
+            reads.append(path.name)
+            if path.name == "cmdline":
+                return b"/usr/bin/python3.14\0/running-bot/paper_trader_integrated.py\0"
+            return b"ALPACA_API_KEY=fake-key\0ALPACA_SECRET_KEY=fake-secret\0OTHER_TOKEN=never-export\0"
+        with patch.object(candidate.subprocess, "check_output", return_value="123\n"), \
+                patch.object(Path, "stat", return_value=SimpleNamespace(st_uid=os.geteuid())), \
+                patch.object(Path, "read_bytes", autospec=True, side_effect=read):
+            self.assertEqual(candidate.service_credentials(source), ("fake-key", "fake-secret"))
+            reads.clear()
+            self.assertIsNone(candidate.service_credentials(Path("/different-bot")))
+            self.assertEqual(reads, ["cmdline"])
 
 
 @unittest.skipUnless(os.name == "posix", "Oracle uses a Linux process lock")
