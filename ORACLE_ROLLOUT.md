@@ -252,6 +252,45 @@ available for inspection, with private `failure-state.json` if recovery failed.
 
 This command does not transfer, re-register or change the frozen Windows studies.
 
+### Wait on Oracle when the market is already open
+
+The closed-market gate is intentional. `tools/wait_oracle_deployment.py start`
+can start one detached, bounded waiter without changing the trading process or
+relaxing that gate. It validates the model, account binding, existing privileges
+and old-runtime recovery on the host first. If the original cutover window is
+already available it can proceed immediately; otherwise its earliest attempt is
+15 minutes after the broker's reported next close, including early-close days.
+No hard-coded market calendar or Finnish UTC offset is used.
+
+```bash
+stage=/home/opc/tradebot-top5-check-20261112T002134546405Z
+cd "$stage"
+nice -n 10 .venv-oracle/bin/python -E -s -u tools/wait_oracle_deployment.py start \
+  --source-dir /home/opc/ai_daytrader_v5_1_python314 \
+  --candidate-dir "$stage/research_runs/oracle-candidate-v1" \
+  --output-dir "$stage/research_runs/oracle-cutover-wait-v1" \
+  --expected-model-sha256 VERIFIED_CANDIDATE_HASH
+```
+
+The worker starts in its own session with disconnected stdin and private log
+files. Confirm its returned PID/status; it then continues without the SSH/PC or
+ChatGPT session. Duplicate launches use locks rather than starting a second
+worker. Code commit, source config, model hash and the paper account identity
+are bound to the intent. Changing those while it waits stops that intent; use a
+separate worktree for other development. It polls read-only data once a minute,
+keeps the original service running, waits for a flat account after the permitted
+window and retries transient read errors within a 24-hour maximum wait. It
+never closes positions or cancels orders to create a flat account.
+
+At eligibility it calls the unchanged cutover command exactly once. All fresh
+model/account/clock/runtime checks, backups, scan and recovery rules still apply.
+An actual failed cutover is recorded instead of blindly retried. A previously
+completed waiter does not schedule another legacy migration. Waiting is not a
+deployment success: inspect `status.json` and `deployment.log` under the waiter
+output and require the deployment command's real result and selected service.
+The logs/intent contain no API credential values. A VM shutdown interrupts this
+process; an SSH or local-PC shutdown does not.
+
 ## Verify selection and pre-open behavior
 
 Before the first replacement-version entry, verify the 100-stock barrier and

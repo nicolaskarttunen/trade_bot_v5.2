@@ -41,7 +41,7 @@ jobs:
       - name: Separate exploratory opening-priority trial on synthetic fixtures
         run: python -m unittest test_open_priority test_cost_margin test_ml_filter_trial test_ml_forward_pair
       - name: Oracle preparation and rollout inspection without network or credentials
-        run: python -m unittest test_oracle_candidate test_oracle_rollout test_oracle_deployment
+        run: python -m unittest test_oracle_candidate test_oracle_rollout test_oracle_deployment test_oracle_deployment_waiter
       - name: Offline regressions with outbound sockets blocked
         run: python tools/run_audit_tests.py --output-dir test-artifacts
       - name: End-user offline simulation command
