@@ -129,6 +129,41 @@ No stop/restart, model copy or service-edit command is supplied here: its exact
 form depends on the runtime and account/state checks above, which have not yet
 been observed. The original paper service has not been changed by preparation.
 
+### Inspect a completed candidate and the existing paper account
+
+After completion, use the tested `tools/check_oracle_rollout.py` from this
+branch, with the candidate's unchanged preparation modules and environment:
+
+```bash
+stage=/home/opc/tradebot-top5-check-20261112T002134546405Z
+cd "$stage"
+.venv-oracle/bin/python tools/check_oracle_rollout.py \
+  --source-dir /home/opc/ai_daytrader_v5_1_python314 \
+  --candidate-dir "$stage/research_runs/oracle-candidate-v1"
+```
+
+The check verifies config/source/environment and all recorded data, matrix and
+model hashes, validates the model and repeats each stock's saved prediction
+probe. It acquires the existing preparation lock without creating files or
+starting training. It then uses only the verified same-user running service's
+Alpaca credential pair for GETs to the fixed **paper** account, positions and
+nested open-orders endpoints. It never constructs a trading client, imports the
+trading process, prints credentials, creates a journal or changes broker/local
+state. A full 500-parent open-order response stops rather than assuming it is
+complete. SQLite is opened with `mode=ro` and `query_only=ON`.
+
+Output includes the current service, configured risk limits, account/queue/
+journal counts and reconciliation findings. `assessment` is always
+`inspection_only_repeat_at_cutover`, even for a flat account. The legacy bot
+continues running during this inspection, so its observations do not replace
+the consistent backup, fresh reconciliation or first-scan verification at the
+actual switch. A service PID/state change during the check stops it.
+
+The command requires the original service to still expose a verifiable same-user
+credential pair. It deliberately does not silently fall back to a different
+environment/file pair and thereby inspect a different paper account. If access
+is unavailable, inspect the running account on the host; never export keys.
+
 ## Verify selection and pre-open behavior
 
 Before the first replacement-version entry, verify the 100-stock barrier and
