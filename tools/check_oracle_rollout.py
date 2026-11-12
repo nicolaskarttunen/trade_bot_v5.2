@@ -68,14 +68,17 @@ def verify_candidate(source, output):
                      candidate_sha256=report["candidate_sha256"])
 
 
-def paper_gets(pair):
+def paper_gets(pair, *, include_clock=False):
     import requests
     with requests.Session() as session:
         session.trust_env = False
         session.headers.update({"APCA-API-KEY-ID": pair[0], "APCA-API-SECRET-KEY": pair[1]})
         result = {}
-        for name, suffix in (("account", "account"), ("positions", "positions"),
-                             ("orders", "orders?status=open&nested=true&limit=500")):
+        endpoints = [("account", "account"), ("positions", "positions"),
+                     ("orders", "orders?status=open&nested=true&limit=500")]
+        if include_clock:
+            endpoints.append(("clock", "clock"))
+        for name, suffix in endpoints:
             try:
                 response = session.get("https://paper-api.alpaca.markets/v2/" + suffix,
                                        timeout=(5, 15), allow_redirects=False)

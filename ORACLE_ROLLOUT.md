@@ -125,9 +125,9 @@ fit from its verified completed matrix. Never delete checkpoints to unblock it.
    order, reconcile new intents and broker state before any rollback; restoring
    an older journal alone would lose order knowledge.
 
-No stop/restart, model copy or service-edit command is supplied here: its exact
-form depends on the runtime and account/state checks above, which have not yet
-been observed. The original paper service has not been changed by preparation.
+Preparation and inspection do not change the service. After the flat legacy
+account has been verified, the separate cutover command below can make the
+explicit service switch with backups, a zero-order scan and startup checks.
 
 ### Inspect a completed candidate and the existing paper account
 
@@ -176,6 +176,81 @@ snapshot; the account still needs reconciliation at cutover.
 The invoking shell's own keys, generic `.env` files and other accounts are not
 fallback sources for this check. If startup inputs have changed or access is
 unavailable, inspect the running account on the host; never export keys.
+
+### Switch the verified flat legacy paper account
+
+`tools/deploy_oracle_paper.py` is an explicitly mutating command. Run it as the
+existing service user from the staging worktree, with its verified interpreter
+and the exact model hash from successful inspection:
+
+```bash
+stage=/home/opc/tradebot-top5-check-20261112T002134546405Z
+cd "$stage"
+nice -n 10 .venv-oracle/bin/python -E -s -u tools/deploy_oracle_paper.py \
+  --source-dir /home/opc/ai_daytrader_v5_1_python314 \
+  --candidate-dir "$stage/research_runs/oracle-candidate-v1" \
+  --expected-model-sha256 VERIFIED_CANDIDATE_HASH
+```
+
+This narrow legacy migration requires 100 configured stocks, an empty opening
+queue, no existing journal or journal sidecars, a flat active paper account,
+supported systemd startup settings and existing password-free sudo rights. It
+does not grant sudo/IAM privileges. The broker clock must be fresh, closed and
+at least 30 minutes before the next open, outside the opening-order window.
+
+The command creates private `tradebot-releases/TIMESTAMP-ID` and
+`tradebot-backups/TIMESTAMP-ID` directories beside the original application.
+It first checks that the original interpreter can re-import dependencies and
+load the original model with the service's selected Python startup variables,
+without importing the trading process or printing its environment. Changed
+systemd startup inputs or an unverified old runtime block the switch while the
+original service stays running. This addresses the earlier interactive NumPy
+import failure rather than assuming the same binary is sufficient for recovery.
+It archives the committed code, preserves the original config byte-for-byte,
+copies the verified candidate, and builds an independent venv on the same host
+using the existing installed Python packages, with no network upgrade. Imports
+must resolve inside that venv; the full model protocol and prediction probes
+must pass there before the old service is stopped. The new systemd command
+uses that release's Python with `-E -s -u`. A final private environment file pins
+the verified existing credential pair and `ALPACA_PAPER=true`; credentials never
+appear in command arguments or reports.
+New stdout/stderr go to the same systemd journal unit instead of appending any
+legacy file destination inside the original tree.
+
+After stopping the original writer, it repeats the flat-account check, archives
+the complete original tree including Git metadata, local config/ignore edits,
+secrets, logs and untracked reports, then copies only the needed runtime files
+into the release. The original tree is never edited or cleaned. Daily counters
+are copied without manual reset. Insufficient disk space, changed config or
+release identity, a remaining source writer or any new position/order blocks
+cutover.
+
+`tools/probe_oracle_entry_scan.py` compiles an explicit AST allowlist of the
+actual production selection/data functions. It never imports the process's
+module body, starts threads, constructs a trading client or initializes a
+journal. Its flat-account inputs are read-only; all submission calls are denied
+and its data client accepts GETs only. It requires every configured symbol to
+be visited in one current five-minute bucket, zero submissions and no per-stock
+API errors. Unavailable signals remain counted and are reported separately;
+100 visits do not mean 100 usable signals or five eligible trades. A partial or
+expired probe restores the unchanged original service.
+
+Only then does the tool install a new uniquely named systemd drop-in, verify the
+selected executable/directory/environment file, start the release and check a
+stable process, its account-bound empty journal and the still-flat paper account.
+Once the switch succeeds, the new service may submit normal paper orders in its
+configured trading windows. `deployment_performed=true` and `result.json` refer
+to this verified service switch, not proof of future scan timing or profitability.
+
+Before a new service has started, failures resume the unchanged original. After
+a start attempt, automatic restoration requires a flat broker snapshot and no
+new journal intents. Otherwise it retains the new state, stops the replacement
+and reports that restoration was not confirmed; reconcile on the host rather
+than overwriting the new journal. No old positions are closed and no broker
+orders are canceled as part of deployment. Backups and failed releases remain
+available for inspection, with private `failure-state.json` if recovery failed.
+
+This command does not transfer, re-register or change the frozen Windows studies.
 
 ## Verify selection and pre-open behavior
 
