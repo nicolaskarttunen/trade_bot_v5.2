@@ -171,22 +171,33 @@ class GateTests(unittest.TestCase):
             self.assertEqual(request.call_args.args[3],0)
 
     def test_probe_rejects_partial_expired_errorful_or_nonzero_submission_reports(self):
-        good=dict(complete=True,status="paused",scanned_count=2,universe_count=2,submitted_count=0,
+        good=dict(complete=True,status="research_only",research_only=True,
+                  daily_risk=dict(date="2026-11-12",trades=5,max_trades_per_day=5,loss_limit_reached=False),
+                  scanned_count=2,universe_count=2,submitted_count=0,
                   signals=[dict(symbol="A",status="unavailable"),dict(symbol="B",status="evaluated")],
                   top5=[],as_of="2026-11-12T12:00:00Z")
         self.assertEqual(probe.validate_report(good,["A","B"])["scanned"],2)
-        for changed in (dict(good,status="expired"),dict(good,scanned_count=1),dict(good,submitted_count=1),
+        for changed in (dict(good,status="expired"),dict(good,status="complete"),dict(good,research_only=False),
+                        dict(good,daily_risk=None),
+                        dict(good,scanned_count=1),dict(good,submitted_count=1),
                         dict(good,signals=[dict(symbol="A",status="unavailable",error="API error"),good["signals"][1]])):
             with self.assertRaises(probe.ProbeError): probe.validate_report(changed,["A","B"])
 
 
 class LiveFunctionProbeTests(unittest.TestCase):
     def test_actual_100_stock_production_functions_use_data_only_and_never_import_process(self):
+        self.exercise_probe()
+
+    def test_actual_probe_preserves_exhausted_daily_budget_and_reached_loss_limit(self):
+        self.exercise_probe(capped=True)
+
+    def exercise_probe(self, capped=False):
         from test_pipeline_contract import CFG, price_frame
         from model_pipeline import fit_bundle
         from features import FEATURES, enrich, label
         raw=price_frame(); train=label(enrich(raw,raw)).dropna(subset=FEATURES+["target"])
-        cfg=dict(CFG,symbols=[f"S{i:03}" for i in range(100)],probability_threshold=0.,trade_score_threshold=0.)
+        cfg=dict(CFG,symbols=[f"S{i:03}" for i in range(100)],probability_threshold=0.,trade_score_threshold=0.,
+                 max_trades_per_day=5)
         bundle=fit_bundle(train,cfg,"neutral")
         fixed=pd.Timestamp.now(tz="UTC").floor("5min") + pd.Timedelta(seconds=20)
         fresh=raw.copy(); fresh.timestamp=pd.date_range(end=fixed.floor("5min")-pd.Timedelta(minutes=5),periods=len(raw),freq="5min")
@@ -200,21 +211,34 @@ class LiveFunctionProbeTests(unittest.TestCase):
             with (root/"models/ensemble.pkl").open("wb") as f: pickle.dump(bundle,f)
             text=(Path(__file__).with_name("paper_trader_integrated.py")).read_text()
             (root/"paper_trader_integrated.py").write_text("raise AssertionError('module body must never run')\n"+text)
+            if capped:
+                state=dict(date=pd.Timestamp.now(tz="America/New_York").date().isoformat(),trades=5,
+                           start_equity=100000.,traded_symbols=["S099"])
+                (root/"paper_live_state.json").write_text(json.dumps(state))
+            before={str(p.relative_to(root)):p.read_bytes() for p in root.rglob("*") if p.is_file()}
             clock=Mock(wraps=pd.Timestamp); clock.now.return_value=fixed
             proxy=SimpleNamespace(**dict(pd.__dict__,Timestamp=clock))
             loader=probe.load_functions
             def load(path,scope):
                 scope["pd"]=proxy
+                scope["telegram_trading_enabled"]=True  # Explicit research return must independently prevent orders.
                 return loader(path,scope)
             with patch.object(probe,"load_functions",side_effect=load),redirect_stdout(io.StringIO()), \
+                    patch.object(probe,"deny_submission",side_effect=AssertionError("No submission call allowed")) as submit, \
                     patch("socket.socket.connect",side_effect=AssertionError("Network forbidden")):
-                report=probe.run_probe(root,root/"evidence",("fake-key","fake-secret"),dict(equity="100000"),data_client=data)
+                report=probe.run_probe(root,root/"evidence",("fake-key","fake-secret"),
+                                       dict(equity="95000" if capped else "100000"),data_client=data)
+                submit.assert_not_called()
             self.assertEqual(report["scanned"],100)
             self.assertEqual(report["submitted"],0)
             self.assertEqual(report["shortlisted"],5)
             self.assertEqual(data.get_stock_bars.call_count,101)
             self.assertEqual(data.get_stock_latest_trade.call_count,5)
-            self.assertFalse((root/"paper_live_state.json").exists())
+            self.assertTrue(report["research_only"])
+            self.assertEqual(report["daily_risk"]["trades"],5 if capped else 0)
+            self.assertEqual(report["daily_risk"]["loss_limit_reached"],capped)
+            self.assertEqual({p: (root/p).read_bytes() for p in before},before)
+            self.assertEqual((root/"paper_live_state.json").exists(),capped)
             self.assertFalse((root/"paper_order_intents.sqlite3").exists())
 
 

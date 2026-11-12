@@ -168,6 +168,64 @@ class FullScanTests(unittest.TestCase):
         self.assertEqual(writes[-1], report)
         json.dumps(report, allow_nan=False)
 
+    def test_daily_limits_still_stop_normal_trading_before_scanning(self):
+        for trades, loss in ((5, False), (0, True), (5, True)):
+            with self.subTest(trades=trades, loss=loss):
+                submit = Mock(side_effect=AssertionError("Daily limit must block orders"))
+                scope, events, writes, _ = self.scope(
+                    get_daily_state=lambda: {"trades": trades, "traded_symbols": []},
+                    daily_loss_reached=lambda state: (loss, 95000., 100000.),
+                    submit_paper_long=submit,
+                )
+                self.assertIsNone(scope["run_entry_scan"]())
+                self.assertEqual(events, [])
+                self.assertEqual(writes, [])
+                submit.assert_not_called()
+
+    def test_research_reviews_all_symbols_at_daily_limits_without_reset_or_submission(self):
+        for trades, loss in ((0, False), (5, False), (0, True), (5, True)):
+            with self.subTest(trades=trades, loss=loss):
+                state = {"date": "2026-11-12", "trades": trades, "traded_symbols": ["S099"]}
+                before = copy.deepcopy(state)
+                submit = Mock(side_effect=AssertionError("Research may never submit"))
+                scope, events, writes, _ = self.scope(
+                    get_daily_state=lambda: state,
+                    daily_loss_reached=lambda state: (loss, 95000., 100000.),
+                    submit_paper_long=submit,
+                )
+                cfg_before = copy.deepcopy(scope["CFG"])
+                report = scope["run_entry_scan"](research_only=True)
+                self.assertEqual(report["status"], "research_only")
+                self.assertTrue(report["research_only"])
+                self.assertEqual(report["scanned_count"], 100)
+                self.assertEqual(report["submitted_count"], 0)
+                self.assertEqual(len(report["top5"]), 5)
+                self.assertEqual([event[0] for event in events], ["signal"] * 100 + ["review"] * 5)
+                self.assertEqual(report["daily_risk"]["trades"], trades)
+                self.assertEqual(report["daily_risk"]["loss_limit_reached"], loss)
+                self.assertNotIn("S099", [row["symbol"] for row in report["top5"]])
+                self.assertEqual(state, before)
+                self.assertEqual(scope["CFG"], cfg_before)
+                self.assertEqual(writes[-1], report)
+                scope["maintain_order_lifecycle"].assert_not_called()
+                submit.assert_not_called()
+
+    def test_research_expiring_during_reviews_is_not_accepted(self):
+        scope, events, _, _ = self.scope()
+        latest = scope["get_latest_trade_price"]
+        def expire(symbol):
+            result = latest(symbol)
+            if sum(event[0] == "review" for event in events) == 5:
+                scope["entry_scan_is_current"] = lambda *args: False
+            return result
+        scope["get_latest_trade_price"] = expire
+        scope["submit_paper_long"] = Mock(side_effect=AssertionError("Research may never submit"))
+        report = scope["run_entry_scan"](research_only=True)
+        self.assertEqual(report["status"], "expired")
+        self.assertEqual(report["scanned_count"], 100)
+        self.assertEqual(report["submitted_count"], 0)
+        scope["submit_paper_long"].assert_not_called()
+
     def test_occupied_and_previously_traded_symbols_are_scanned_but_not_selected(self):
         scope, events, _, _ = self.scope(
             get_daily_state=lambda: {"trades": 1, "traded_symbols": ["S099"]},

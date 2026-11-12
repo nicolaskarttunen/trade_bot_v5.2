@@ -1747,18 +1747,22 @@ def entry_scan_is_current(as_of, opening=False):
     return True
 
 
-def run_entry_scan(opening=False):
-    """Collect all symbols, review the top five, then consider paper orders."""
+def run_entry_scan(opening=False, *, research_only=False):
+    """Collect/review signals; explicit research returns before entry submission."""
     as_of = pd.Timestamp.now(tz="UTC")
     state = get_daily_state()
     reached, equity, _ = daily_loss_reached(state)
-    if reached or state["trades"] >= int(CFG["max_trades_per_day"]):
+    if not research_only and (reached or state["trades"] >= int(CFG["max_trades_per_day"])):
         return None
     occupied, _ = get_portfolio_entry_usage()
     blocked = occupied | set(state.get("traded_symbols", []))
     report = {
         "as_of": as_of.isoformat(),
         "mode": "opening" if opening else "intraday",
+        "research_only": bool(research_only),
+        "daily_risk": {"date": state.get("date"), "trades": state["trades"],
+                       "max_trades_per_day": int(CFG["max_trades_per_day"]),
+                       "loss_limit_reached": bool(reached)},
         "status": "scanning",
         "universe_count": len(SYMBOLS),
         "scanned_count": 0,
@@ -1777,7 +1781,8 @@ def run_entry_scan(opening=False):
         snapshot_news = [dict(item) for item in news_items]
     candidates = []
     for symbol in SYMBOLS:
-        maintain_order_lifecycle()
+        if not research_only:
+            maintain_order_lifecycle()
         if not entry_scan_is_current(as_of, opening):
             report["status"] = "expired"
             atomic_json(ENTRY_SCAN_FILE, report)
@@ -1845,6 +1850,12 @@ def run_entry_scan(opening=False):
             review["error"] = str(exc)
     report["status"] = "reviewed"
     atomic_json(ENTRY_SCAN_FILE, report)
+
+    if research_only:
+        report["status"] = "research_only" if entry_scan_is_current(as_of, opening) else "expired"
+        report["submitted_count"] = 0
+        atomic_json(ENTRY_SCAN_FILE, report)
+        return report
 
     available_slots = int(CFG["max_trades_per_day"]) - int(state["trades"])
     submitted = 0

@@ -235,6 +235,16 @@ API errors. Unavailable signals remain counted and are reported separately;
 100 visits do not mean 100 usable signals or five eligible trades. A partial or
 expired probe restores the unchanged original service.
 
+The probe explicitly calls `run_entry_scan(research_only=True)`. This mode can
+collect and review signals when the real day's trade budget or loss limit is
+already reached, then returns before the entire submission phase. It reports
+the actual daily risk inputs, keeps the stored counters/config byte-for-byte,
+and has independent submission and HTTP-write denial. Ordinary trading calls
+retain their original early stop at either daily limit. This fixes the observed
+12 November cutover failure at five trades out of five; resetting the daily
+state or increasing its limit is not part of the remedy. A failed attempt's
+backup/release/logs must remain available when starting a separate new attempt.
+
 Only then does the tool install a new uniquely named systemd drop-in, verify the
 selected executable/directory/environment file, start the release and check a
 stable process, its account-bound empty journal and the still-flat paper account.

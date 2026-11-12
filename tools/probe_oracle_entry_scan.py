@@ -42,7 +42,9 @@ def load_functions(path, scope):
 
 
 def validate_report(report, symbols):
-    if (not report or not report.get("complete") or report.get("status") not in {"complete", "paused"}
+    if (not report or not report.get("complete") or report.get("status") != "research_only"
+            or report.get("research_only") is not True
+            or not isinstance(report.get("daily_risk"), dict)
             or report.get("scanned_count") != len(symbols) or report.get("universe_count") != len(symbols)
             or len(report.get("signals", [])) != len(symbols)
             or {r["symbol"] for r in report["signals"]} != set(symbols)
@@ -54,6 +56,7 @@ def validate_report(report, symbols):
     return dict(scanned=report["scanned_count"], universe=len(symbols),
                 signal_status_counts=dict(Counter(r["status"] for r in report["signals"])),
                 shortlisted=len(report["top5"]), submitted=0, as_of=report["as_of"],
+                research_only=True, daily_risk=report["daily_risk"],
                 classification="read_only_production_function_probe")
 
 
@@ -116,7 +119,7 @@ def run_probe(release, output, pair, account, *, data_client=None):
         submit_paper_long=deny_submission, telegram_trading_enabled=False,
         news_lock=threading.Lock(), news_items=[], telegram_lock=threading.Lock(), telegram_signals=[])
     load_functions(release / "paper_trader_integrated.py", scope)
-    report = scope["run_entry_scan"]()
+    report = scope["run_entry_scan"](research_only=True)
     summary = validate_report(report, cfg["symbols"])
     (output / "summary.json").write_text(json.dumps(summary, indent=2))
     return summary
@@ -140,7 +143,10 @@ def main():
             raise ProbeError("Paper account is not flat for the scan probe")
         run_probe(BASE, args.output_dir, pair, broker["account"])
     except Exception as error:
-        print("PROBE_STOPPED", type(error).__name__)
+        # Only our fixed, authored validation messages may leave this process;
+        # arbitrary SDK exceptions can contain remote response details.
+        detail = str(error) if isinstance(error, ProbeError) else "Inspect the private probe evidence"
+        print("PROBE_STOPPED", type(error).__name__, detail)
         return 1
     return 0
 
