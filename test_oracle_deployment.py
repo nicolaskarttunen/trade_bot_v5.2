@@ -45,6 +45,8 @@ class CutoverTests(unittest.TestCase):
         class FakeHost:
             def __init__(self):
                 self.selected = original; self.active = True; self.events = []
+                self.environment_file = PurePosixPath("/etc/v52-paper-test.env")
+                self.base_interpreter = PurePosixPath("/usr/bin/python3.14")
             def stop(self): self.events.append("stop"); self.active = False
             def info(self):
                 return dict(WorkingDirectory=str(self.selected), MainPID="1" if self.active else "0",
@@ -153,10 +155,24 @@ class GateTests(unittest.TestCase):
     def test_paper_environment_and_unit_are_explicit_and_secret_encoding_is_restricted(self):
         self.assertIn("ALPACA_PAPER=true", deploy.service_env(("fake-key","fake-secret")))
         with self.assertRaises(deploy.DeployError): deploy.service_env(("bad\nkey","secret"))
-        unit=deploy.override_text(PurePosixPath("/home/opc/release"),PurePosixPath("/home/opc/release/.venv/bin/python"))
+        unit=deploy.override_text(PurePosixPath("/home/opc/release"),PurePosixPath("/home/opc/release/.venv/bin/python"),
+                                  PurePosixPath("/etc/v52-paper-test.env"),PurePosixPath("/usr/bin/python3.14"))
         self.assertIn("ExecStart=\n",unit); self.assertIn(" -E -s -u ",unit)
-        self.assertIn("EnvironmentFile=/home/opc/release/.paper-service.env",unit)
+        self.assertIn("EnvironmentFile=/etc/v52-paper-test.env",unit)
+        self.assertIn("ExecStart=@/usr/bin/python3.14 /home/opc/release/.venv/bin/python",unit)
         self.assertNotIn("fake-secret",unit)
+
+    def test_runtime_probe_preserves_service_restrictions_without_unit_relationships(self):
+        text=("[Unit]\nRequires=original.service\nOnFailure=notify.service\n"
+              "[Service]\nUser=opc\nProtectHome=read-only\nNoNewPrivileges=yes\n"
+              "EnvironmentFile=/etc/original.env\n[Install]\nWantedBy=multi-user.target\n"
+              "# /etc/drop-in.conf\n[Service]\nPrivateTmp=yes\n")
+        result=deploy.service_settings(text)
+        for value in ("User=opc","ProtectHome=read-only","NoNewPrivileges=yes",
+                      "EnvironmentFile=/etc/original.env","PrivateTmp=yes"):
+            self.assertIn(value,result)
+        for value in ("Requires=","OnFailure=","WantedBy="):
+            self.assertNotIn(value,result)
 
     def test_data_transport_rejects_writes_and_bounds_gets_without_redirects(self):
         from alpaca.data.historical import StockHistoricalDataClient
@@ -270,11 +286,92 @@ class RuntimePackagingTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()),patch("socket.socket.connect",side_effect=AssertionError("Network forbidden")):
                 prep.run(source,candidate,fetch=lambda p:dict(bars={p["symbols"]:frames[p["symbols"]]}))
                 runtime=deploy.prepare_release(stage,source,candidate,release,Path(sys.executable), ("fake-key","fake-secret"))
+            command=[str(runtime),"-E","-s","-u",str(release/"tools/check_oracle_service_runtime.py"),
+                     "--release-dir",str(release),"--expected-uid",str(os.geteuid()),
+                     "--base-interpreter",str(Path(sys._base_executable).resolve())]
+            env=dict(os.environ,ALPACA_API_KEY="fake-key",ALPACA_SECRET_KEY="fake-secret",ALPACA_PAPER="true")
+            result=subprocess.run(command,executable=str(Path(sys._base_executable).resolve()),env=env,
+                                  check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=60)
+            self.assertIn("SERVICE_RUNTIME_VERIFIED",result.stdout)
+            proof=json.loads((release/".service-runtime-proof.json").read_text())
+            self.assertTrue(proof["environment_matches"])
+            self.assertTrue(proof["network_blocked"])
+            self.assertEqual(proof["prefix"],str(release/".venv"))
+            self.assertFalse((release/"paper_order_intents.sqlite3").exists())
+            mismatch=subprocess.run(command,executable=str(Path(sys._base_executable).resolve()),
+                                    env=dict(env,ALPACA_SECRET_KEY="wrong-secret"),
+                                    stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=60)
+            self.assertEqual(mismatch.returncode,1)
+            self.assertNotIn("wrong-secret",mismatch.stdout+mismatch.stderr)
             self.assertEqual(runtime,release/".venv/bin/python")
             self.assertEqual((release/"config.json").read_bytes(),(source/"config.json").read_bytes())
             self.assertEqual((release/"models/ensemble.pkl").read_bytes(),(candidate/"candidate.pkl").read_bytes())
             self.assertEqual(before,{str(p.relative_to(source)):p.read_bytes() for p in source.rglob("*") if p.is_file()})
             self.assertNotEqual(runtime.parent.parent.resolve(),Path(sys.prefix).resolve())
+
+
+@unittest.skipUnless(os.name == "posix", "Root-owned environment and system service startup are Linux-specific")
+class SystemServiceRuntimeTests(unittest.TestCase):
+    def exercise(self, *, fail_start=False, mode=b"0 0 600\n"):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);backup=root/"backup";release=root/"release";backup.mkdir();release.mkdir()
+            (release/"models").mkdir();(release/"models/ensemble.pkl").write_bytes(b"model")
+            (release/"config.json").write_text("{}")
+            (release/".paper-service.env").write_text("ALPACA_API_KEY=fake-key\nALPACA_SECRET_KEY=fake-secret\n")
+            host=deploy.Host(PurePosixPath("/etc/systemd/system/v52-paper-bot.service.d/zz-test-runtime.conf"))
+            host.backup=backup;host.original_settings="[Service]\nUser=opc\nNoNewPrivileges=yes\n"
+            events=[]
+            def sudo(*args):
+                events.append(tuple(map(str,args)))
+                if args[0]=="stat": return mode
+                if args[:2]==("systemctl","start"):
+                    self.assertNotEqual(args[2],deploy.SERVICE)
+                    if fail_start: raise subprocess.CalledProcessError(1,["systemctl","start"],stderr=b"Permission denied")
+                    deploy.save_json(release/".service-runtime-proof.json",dict(
+                        uid=os.geteuid(),prefix=str(release/".venv"),base_interpreter=str(host.base_interpreter),
+                        model_sha256=deploy.digest(release/"models/ensemble.pkl"),
+                        config_sha256=deploy.digest(release/"config.json"),
+                        environment_matches=True,paper=True,write_test=True,network_blocked=True))
+                return b"runtime journal\n" if args[0]=="journalctl" else b""
+            with patch.object(host,"sudo",side_effect=sudo),patch.object(host,"restore_context"), \
+                    patch.object(host,"command",return_value=b"Result=success\nExecMainStatus=0\n"), \
+                    patch("socket.socket.connect",side_effect=AssertionError("Network forbidden")):
+                if fail_start:
+                    with self.assertRaisesRegex(deploy.DeployError,"before stopping the original"):
+                        host.verify_runtime(release,release/".venv/bin/python")
+                    self.assertTrue((backup/"runtime-check-log.txt").is_file())
+                elif mode!=b"0 0 600\n":
+                    with self.assertRaisesRegex(deploy.DeployError,"root-owned mode 0600"):
+                        host.verify_runtime(release,release/".venv/bin/python")
+                else:
+                    result=host.verify_runtime(release,release/".venv/bin/python")
+                    self.assertTrue(result["paper"])
+                    unit=(backup/"runtime-check.service").read_text()
+                    self.assertIn("NoNewPrivileges=yes",unit)
+                    self.assertIn("User=opc",unit)
+                    self.assertIn(f"EnvironmentFile={host.environment_file}",unit)
+                    self.assertNotIn("fake-secret",unit)
+                    self.assertTrue((backup/"runtime-check.json").is_file())
+                self.assertFalse(any(e[:2]==("systemctl","stop") and e[2]==deploy.SERVICE for e in events))
+                installs=[e for e in events if e[0]=="install"]
+                self.assertTrue(all(e[1:8]==("-T","-m","0600","-o","root","-g","root") for e in installs))
+                self.assertTrue(all("fake-secret" not in str(e) for e in events))
+
+    def test_private_environment_and_actual_launch_are_verified_before_original_stop(self): self.exercise()
+
+    def test_manager_cannot_read_environment_original_is_not_stopped(self): self.exercise(fail_start=True)
+
+    def test_incorrect_environment_permissions_stop_before_probe_start(self): self.exercise(mode=b"0 0 644\n")
+
+    def test_failed_host_command_retains_private_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temp:
+            host=deploy.Host(PurePosixPath("/etc/test.conf"));host.backup=Path(temp)
+            error=subprocess.CalledProcessError(1,["systemctl","start"],stderr=b"private failure details")
+            with patch.object(deploy.subprocess,"check_output",side_effect=error):
+                with self.assertRaises(subprocess.CalledProcessError): host.command(["systemctl","start","fixture.service"])
+            path=Path(temp)/"failed-host-command.json"
+            self.assertEqual(path.stat().st_mode & 0o777,0o600)
+            self.assertEqual(json.loads(path.read_text())["returncode"],1)
 
 
 if __name__ == "__main__": unittest.main()

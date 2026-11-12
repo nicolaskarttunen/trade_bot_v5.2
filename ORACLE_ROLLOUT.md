@@ -211,11 +211,37 @@ copies the verified candidate, and builds an independent venv on the same host
 using the existing installed Python packages, with no network upgrade. Imports
 must resolve inside that venv; the full model protocol and prediction probes
 must pass there before the old service is stopped. The new systemd command
-uses that release's Python with `-E -s -u`. A final private environment file pins
-the verified existing credential pair and `ALPACA_PAPER=true`; credentials never
-appear in command arguments or reports.
+executes the verified base Python binary with the release venv path as argv[0],
+using systemd's documented `@` prefix and `-E -s -u`. The exact launch must
+resolve `sys.prefix` and dependency origins inside that release's independent
+venv. This avoids executing a home-directory binary or symlink directly.
+A unique `/etc/v52-paper-zz-oracle-top5-TAG.env`, owned by root with mode 0600,
+pins the verified existing credential pair and `ALPACA_PAPER=true`. The existing
+`/etc/v52-paper-bot.env` stays untouched. Credentials never appear in command
+arguments or reports. The private release copy remains available for its
+data-only probes and the retained backup; neither copy is made world-readable.
 New stdout/stderr go to the same systemd journal unit instead of appending any
 legacy file destination inside the original tree.
+
+Before stopping the old process, a separate oneshot system unit tests the exact
+base-binary/venv launch and root-owned environment file. It inherits the original
+Service settings, including its user and security restrictions, but no Unit
+relationships or Install hooks. Unsupported lifecycle hooks or managed directory
+settings stop preparation. The test imports dependencies, validates the model,
+compares credential values privately, checks paper mode and temporary write
+access, and writes a private proof. It denies socket connections and never
+imports the trading module body or creates a journal, client, order or thread.
+Its temporary unit is stopped and removed; the original service remains running
+until this proof succeeds. A failed proof leaves private `runtime-check-log.txt`
+and command diagnostics in the new backup. The dedicated root environment file
+is retained with the release and recorded in the manifest, including on rollback.
+
+This addresses the observed 12 November manager error, "Failed to load
+environment files: Permission denied", before a replacement process could start.
+Default SELinux file labels are restored only on the newly installed files when
+`restorecon` exists. No policy, sudo/IAM rights or host security mode is changed.
+See the primary [systemd environment-file documentation](https://www.freedesktop.org/software/systemd/man/250/systemd.exec.html#EnvironmentFile=)
+and [argv[0] launch syntax](https://www.freedesktop.org/software/systemd/man/250/systemd.service.html#ExecStart=).
 
 After stopping the original writer, it repeats the flat-account check, archives
 the complete original tree including Git metadata, local config/ignore edits,

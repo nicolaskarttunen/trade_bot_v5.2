@@ -80,20 +80,45 @@ def service_env(pair):
     return f"ALPACA_API_KEY={pair[0]}\nALPACA_SECRET_KEY={pair[1]}\nALPACA_PAPER=true\n"
 
 
-def override_text(release, interpreter):
-    if any(not re.fullmatch(r"/[A-Za-z0-9_/ .\-]+", str(p)) or " " in str(p) for p in (release, interpreter)):
+def override_text(release, interpreter, environment_file, base_interpreter):
+    if any(not re.fullmatch(r"/[A-Za-z0-9_/ .\-]+", str(p)) or " " in str(p)
+           for p in (release, interpreter, environment_file, base_interpreter)):
         raise DeployError("Use ordinary absolute deployment paths without spaces")
     return (f"[Service]\nWorkingDirectory={release}\nExecStart=\n"
-            f"ExecStart={interpreter} -E -s -u {release}/paper_trader_integrated.py\n"
-            f"EnvironmentFile={release}/.paper-service.env\nStandardOutput=journal\nStandardError=journal\n")
+            f"ExecStart=@{base_interpreter} {interpreter} -E -s -u {release}/paper_trader_integrated.py\n"
+            f"EnvironmentFile={environment_file}\nStandardOutput=journal\nStandardError=journal\n")
+
+
+def service_settings(unit_text):
+    """Copy effective Service fragments, without Unit relationships or Install hooks."""
+    lines = ["[Service]\n"]
+    selected = False
+    for line in unit_text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            selected = stripped == "[Service]"
+        elif selected:
+            lines.append(line)
+    return "".join(lines) + "\n"
 
 
 class Host:
     def __init__(self, override):
         self.override = override
+        self.environment_file = Path("/etc") / ("v52-paper-" + override.stem + ".env")
+        self.base_interpreter = Path(sys._base_executable).resolve()
+        self.backup = None
+        self.original_settings = None
 
     def command(self, argv, timeout=90):
-        return subprocess.check_output(argv, stderr=subprocess.PIPE, timeout=timeout)
+        try:
+            return subprocess.check_output(argv, stderr=subprocess.PIPE, timeout=timeout)
+        except subprocess.CalledProcessError as error:
+            if self.backup is not None:
+                save_json(self.backup / "failed-host-command.json", dict(
+                    command=list(map(str, argv)), returncode=error.returncode,
+                    stderr=(error.stderr or b"").decode(errors="replace")))
+            raise
 
     def sudo(self, *args):
         return self.command(["sudo", "-n", *map(str, args)])
@@ -102,19 +127,105 @@ class Host:
         return check.service_info()
 
     def prepare(self, backup, source, service):
+        self.backup = backup
         self.sudo("true")
         if self.override.exists():
             raise DeployError("Deployment override path already exists")
-        properties = ["Type", "KillMode", "ExecStartPre", "ExecStartPost", "RootDirectory", "RootImage",
+        hooks = ["ExecStartPre", "ExecStartPost", "ExecCondition", "ExecStop", "ExecStopPost"]
+        directories = ["RuntimeDirectory", "StateDirectory", "CacheDirectory", "LogsDirectory", "ConfigurationDirectory"]
+        properties = ["Type", "KillMode", *hooks, *directories, "RootDirectory", "RootImage",
                       "ExecStart", "FragmentPath", "DropInPaths", "EnvironmentFiles"]
         raw = self.command(["systemctl", "show", SERVICE,
                            *(a for p in properties for a in ("-p", p)), "--no-pager"]).decode()
         values = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
         if (values.get("Type") not in {"simple", "exec"} or values.get("KillMode") != "control-group"
-                or any(values.get(p) for p in ("ExecStartPre", "ExecStartPost", "RootDirectory", "RootImage"))):
+                or any(values.get(p) for p in (*hooks, *directories, "RootDirectory", "RootImage"))):
             raise DeployError("Existing service hooks or isolation require a host-specific switch")
-        private_write(backup / "original-unit.txt", self.command(["systemctl", "cat", SERVICE]).decode())
-        verify_original_runtime(source, service, values)
+        original = self.command(["systemctl", "cat", SERVICE]).decode()
+        private_write(backup / "original-unit.txt", original)
+        self.original_settings = service_settings(original)
+        original_python = verify_original_runtime(source, service, values)
+        if original_python.resolve() != self.base_interpreter:
+            raise DeployError("The staging venv is not based on the verified original Python binary")
+
+    def restore_context(self, path):
+        command = shutil.which("restorecon")
+        if command is None and Path("/usr/sbin/restorecon").is_file():
+            command = "/usr/sbin/restorecon"
+        if command is not None:
+            self.sudo(command, path)  # Default label on this one newly installed file only.
+
+    def verify_runtime(self, release, interpreter):
+        """Ask PID1 to exercise the exact launch before stopping the original writer."""
+        if self.original_settings is None or self.backup is None:
+            raise DeployError("Original service settings must be verified first")
+        # A unique root-only file in /etc is readable by the service manager;
+        # the original environment file and all host security policies stay intact.
+        self.sudo("test", "!", "-e", self.environment_file)
+        self.sudo("test", "!", "-L", self.environment_file)
+        self.sudo("install", "-T", "-m", "0600", "-o", "root", "-g", "root",
+                  release / ".paper-service.env", self.environment_file)
+        self.restore_context(self.environment_file)
+        mode = self.sudo("stat", "-c", "%u %g %a", self.environment_file).decode().strip()
+        if mode != "0 0 600":
+            raise DeployError("Dedicated system environment file is not root-owned mode 0600")
+        probe_name = self.override.stem + "-runtime-check.service"
+        probe_path = Path("/etc/systemd/system") / probe_name
+        self.sudo("test", "!", "-e", probe_path)
+        self.sudo("test", "!", "-L", probe_path)
+        proof = release / ".service-runtime-proof.json"
+        if proof.exists():
+            raise DeployError("Runtime proof path already exists")
+        unit = (self.original_settings + "\n[Service]\nType=oneshot\nRestart=no\nRemainAfterExit=no\n"
+                "TimeoutStartSec=45\nExecStart=\nExecReload=\n"
+                f"WorkingDirectory={release}\nEnvironmentFile={self.environment_file}\n"
+                "StandardOutput=journal\nStandardError=journal\n"
+                f"ExecStart=@{self.base_interpreter} {interpreter} -E -s -u "
+                f"{release}/tools/check_oracle_service_runtime.py --release-dir {release} "
+                f"--expected-uid {os.geteuid()} --base-interpreter {self.base_interpreter}\n")
+        local_unit = self.backup / "runtime-check.service"
+        private_write(local_unit, unit)
+        installed = False
+        loaded = False
+        try:
+            installed = True
+            self.sudo("install", "-T", "-m", "0600", "-o", "root", "-g", "root", local_unit, probe_path)
+            self.restore_context(probe_path)
+            loaded = True
+            self.sudo("systemctl", "daemon-reload")
+            self.sudo("systemctl", "start", probe_name)
+            state = self.command(["systemctl", "show", probe_name, "-p", "Result", "-p", "ExecMainStatus", "--no-pager"]).decode()
+            values = dict(line.split("=", 1) for line in state.splitlines() if "=" in line)
+            evidence = check.read(proof)
+            if (values.get("Result") != "success" or values.get("ExecMainStatus") != "0"
+                    or evidence.get("uid") != os.geteuid() or evidence.get("prefix") != str(release / ".venv")
+                    or evidence.get("base_interpreter") != str(self.base_interpreter)
+                    or evidence.get("model_sha256") != digest(release / "models/ensemble.pkl")
+                    or evidence.get("config_sha256") != digest(release / "config.json")
+                    or not all(evidence.get(k) is True for k in ("environment_matches", "paper", "write_test", "network_blocked"))):
+                raise DeployError("Systemd did not confirm the isolated, private paper runtime")
+            save_json(self.backup / "runtime-check.json", evidence)
+            return evidence
+        except Exception:
+            try:
+                log = self.sudo("journalctl", "-u", probe_name, "-n", "60", "--no-pager")
+                private_write(self.backup / "runtime-check-log.txt", log.decode(errors="replace"))
+            except Exception:
+                pass
+            raise DeployError(f"Systemd runtime preflight failed before stopping the original; inspect {self.backup}") from None
+        finally:
+            if installed:
+                errors = []
+                commands = [("rm", "-f", probe_path), ("systemctl", "daemon-reload")]
+                if loaded:
+                    commands.insert(0, ("systemctl", "stop", probe_name))
+                for command in commands:
+                    try:
+                        self.sudo(*command)
+                    except Exception:
+                        errors.append(command[0])
+                if errors:
+                    raise DeployError("Runtime probe cleanup was not confirmed; original service has not been stopped")
 
     def stop(self):
         self.sudo("systemctl", "stop", SERVICE)
@@ -124,6 +235,7 @@ class Host:
 
     def install(self, path):
         self.sudo("install", "-D", "-m", "0644", path, self.override)
+        self.restore_context(self.override)
         self.sudo("systemctl", "daemon-reload")
 
     def verify_unit(self, release, interpreter):
@@ -132,9 +244,10 @@ class Host:
         values = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
         expected = f"argv[]={interpreter} -E -s -u {release}/paper_trader_integrated.py ;"
         if (values.get("WorkingDirectory") != str(release) or expected not in values.get("ExecStart", "")
+                or f"path={self.base_interpreter} ;" not in values.get("ExecStart", "")
                 or values["ExecStart"].count("argv[]=") != 1
                 or values.get("StandardOutput") != "journal" or values.get("StandardError") != "journal"
-                or not values.get("EnvironmentFiles", "").endswith(f"{release}/.paper-service.env (ignore_errors=no)")):
+                or not values.get("EnvironmentFiles", "").endswith(f"{self.environment_file} (ignore_errors=no)")):
             raise DeployError("Systemd did not select the exact release, interpreter and final paper environment")
 
     def start(self):
@@ -206,6 +319,7 @@ def verify_original_runtime(source, service, unit):
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
     except (OSError, subprocess.SubprocessError):
         raise DeployError("Original interpreter/model recovery check failed; original service remains running") from None
+    return Path(paths[0])
 
 
 def assert_no_source_writer(source):
@@ -267,6 +381,7 @@ _, verified = verify_candidate(source, candidate)
 assert digest(release / 'models/ensemble.pkl') == verified['candidate_sha256']
 """
     subprocess.run([str(new_python), "-E", "-s", "-c", validation, str(release), str(source), str(candidate)],
+                   executable=str(Path(sys._base_executable).resolve()),
                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
     return new_python
 
@@ -274,7 +389,8 @@ assert digest(release / 'models/ensemble.pkl') == verified['candidate_sha256']
 def release_identity(release):
     names = ("paper_trader_integrated.py", "features.py", "news_features.py", "model_pipeline.py",
              "ml_models.py", "entry_selection.py", "order_journal.py", "order_lifecycle.py",
-             "paper_order_adapter.py", "config.json", "models/ensemble.pkl")
+             "paper_order_adapter.py", "tools/check_oracle_service_runtime.py",
+             "tools/probe_oracle_entry_scan.py", "config.json", "models/ensemble.pkl")
     return {name: digest(release / name) for name in names}
 
 
@@ -335,9 +451,12 @@ def cutover(source, release, backup, interpreter, pair, host, broker_get, *, pro
         snapshot = broker_get()
         require_flat(source, snapshot, account_id); require_closed_window(snapshot["clock"])
         override = backup / "new-override.conf"
-        private_write(override, override_text(release, interpreter))
+        private_write(override, override_text(release, interpreter, host.environment_file, host.base_interpreter))
         installed = True  # Also clean up a partially failed install of this unique path.
-        host.install(override); host.verify_unit(release, interpreter)
+        host.install(override)
+        print("DEPLOY_PHASE override_installed", flush=True)
+        host.verify_unit(release, interpreter)
+        print("DEPLOY_PHASE unit_selection_verified", flush=True)
         snapshot = broker_get()
         require_flat(source, snapshot, account_id); require_closed_window(snapshot["clock"])
         if (source / "config.json").read_bytes() != (release / "config.json").read_bytes():
@@ -345,6 +464,7 @@ def cutover(source, release, backup, interpreter, pair, host, broker_get, *, pro
         if identity is not None and identity != release_identity(release):
             raise DeployError("Verified release identity changed during rollout")
         start_attempted = True
+        print("DEPLOY_PHASE replacement_start_requested", flush=True)
         host.start()
         info = host.healthy(release, account_id)
         snapshot = broker_get()
@@ -407,9 +527,12 @@ def deploy(source, candidate, expected_model):
     commit = subprocess.check_output(["git", "-C", str(BASE), "rev-parse", "HEAD"], text=True).strip()
     save_json(backup / "manifest.json", dict(code_commit=commit, candidate=verified,
               source=str(source), release=str(release), interpreter=str(interpreter),
+              base_interpreter=str(host.base_interpreter), environment_file=str(host.environment_file),
               override=str(host.override), configured_risk={k: cfg[k] for k in (
                   "max_position_pct", "max_total_exposure_pct", "risk_per_trade_pct", "max_daily_loss_pct")},
               config_sha256=digest(source / "config.json")))
+    host.verify_runtime(release, interpreter)
+    print("DEPLOY_PHASE systemd_runtime_verified_original_still_running", flush=True)
     result = cutover(source, release, backup, interpreter, pair, host,
                      lambda: check.paper_gets(pair, include_clock=True), expected_service=service,
                      identity=release_identity(release))
