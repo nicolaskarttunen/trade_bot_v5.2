@@ -52,3 +52,7 @@ completion. The frozen forward/ML-pair studies and their models are untouched.
 After preparation, deployment still needs the source config, model, process
 environment, broker positions, pending orders and journal checked, followed by
 an explicit service switch and verification of the 100-stock selection barrier.
+
+See [the rollout gates and read-only status check](ORACLE_ROLLOUT.md) before
+changing any service. The [registered Windows studies](WINDOWS_STUDY_MIGRATION.md)
+need a separate verified transfer; this candidate does not migrate them.
