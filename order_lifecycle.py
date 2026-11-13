@@ -138,6 +138,11 @@ class OrderLifecycle:
         for entry in self.journal.rows():
             if entry["settled"] or entry["role"] != "entry" or entry["state"] != "observed":
                 continue
+            if entry["metadata"].get("mode") != "opening":
+                # Intraday brackets already own their exits. Canceling their
+                # partial parent also cancels those exits and strands the fill.
+                # Only standalone opening BUYs use this cancel-and-protect flow.
+                continue
             filled = decimal_value(entry["filled_qty"])
             if not filled:
                 continue
@@ -147,10 +152,6 @@ class OrderLifecycle:
             if entry["status"] not in TERMINAL:
                 self._request_partial_cancel(entry)
                 blockers.append(f"{entry['symbol']}: partial BUY; waiting for terminal cancellation/fill")
-                continue
-            if entry["metadata"].get("mode") != "opening":
-                # A canceled partial bracket can have hidden/inactive children.
-                # Do not attach a competing OCO without broker-specific proof.
                 continue
             protection_id = client_id(self.journal.account_id, entry["session"], entry["symbol"], "protection")
             protection = self.journal.get(protection_id)

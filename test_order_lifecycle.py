@@ -235,6 +235,47 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(len(self.broker.sends),1)
         self.assertTrue(self.life.entry_blockers(SESSION))
 
+    def test_intraday_partial_bracket_keeps_parent_and_children_until_full_fill(self):
+        self.life.submit_once(SESSION, "A", "entry", lambda cid: request(
+            cid, "A", 10, type="market", order_class="bracket",
+            stop_loss={"stop_price": 98},
+            take_profit={"limit_price": 104}), 100,
+            {"mode": "intraday", "stop_distance": 2, "reward_risk_ratio": 2})
+        entry = self.entry()
+        parent = self.broker.orders[entry["client_id"]]
+        stop = acknowledged(request("stop-leg", "A", 10, "sell", type="stop"))
+        stop.update(status="held", stop_price=98, order_class="bracket")
+        target = acknowledged(request("target-leg", "A", 10, "sell", type="limit"))
+        target.update(status="held", limit_price=104, order_class="bracket")
+        parent.update(status="partially_filled", filled_qty=4,
+                      filled_avg_price=100, legs=[target, stop])
+        self.broker.positions = [dict(symbol="A", qty=4)]
+        self.life.reconcile()
+
+        # Maintenance may block further entries while the BUY is partial,
+        # but must leave the broker-managed bracket intact on every poll.
+        for _ in range(3):
+            self.life.maintain_opening_protection(oco)
+            self.assertTrue(self.life.entry_blockers(SESSION))
+        self.assertEqual(self.broker.cancels, [])
+        self.assertEqual(self.entry()["cancel_requested"], 0)
+        self.assertEqual(len(self.broker.sends), 1)
+        self.assertIsNone(self.journal.get(
+            client_id("paper-account", SESSION, "A", "protection")))
+        self.assertEqual([leg["status"] for leg in parent["legs"]], ["held", "held"])
+
+        # Once the remaining six shares fill, Alpaca activates the original
+        # ten-share exits. Their observed stop must pass the existing guard.
+        parent.update(status="filled", filled_qty=10)
+        for leg in parent["legs"]:
+            leg["status"] = "new"
+        self.broker.positions = [dict(symbol="A", qty=10)]
+        self.life.reconcile()
+        self.life.maintain_opening_protection(oco)
+        self.assertEqual(self.life.entry_blockers(SESSION), [])
+        self.assertEqual(self.broker.cancels, [])
+        self.assertEqual(len(self.broker.sends), 1)
+
     def test_fractional_fill_is_not_truncated_into_protection(self):
         self.send(); self.fill(3.5,"canceled")
         self.assertTrue(self.life.maintain_opening_protection(oco))

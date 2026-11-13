@@ -344,6 +344,15 @@ too; separately report their number. It does not imply 100 usable signals or
 five eligible trades. Zero eligible candidates is a valid outcome. Expired or
 partially scanned decisions must not submit entries.
 
+Opening-order maintenance must never cancel a partially filled intraday bracket.
+Canceling a bracket parent can also cancel its protective children. Only an entry
+explicitly recorded with `mode=opening` uses the cancel-then-OCO flow; intraday
+partial fills continue blocking new entries until their broker state is resolved.
+This guard prevents a new cancellation, but does not repair an already canceled
+bracket. For an existing partial position, verify the final parent fill, all exit
+legs and the current position before deciding its recovery or switching versions.
+Keep that position's journal and consumed daily trade slot intact.
+
 The current opening window is 09:15 through before 09:28 America/New_York.
 Each scan must also remain within its five-minute clock bucket. Schedule and
 assess this in New York time rather than hard-coding a Finnish offset across
