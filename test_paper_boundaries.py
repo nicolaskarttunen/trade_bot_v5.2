@@ -5,7 +5,7 @@ from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, sentinel
 import pandas as pd
 from features import completed_bars
 from test_pipeline_contract import price_frame
@@ -81,15 +81,16 @@ class PaperBoundaryTests(unittest.TestCase):
         for ts in (now, now+pd.Timedelta(minutes=5), now-pd.Timedelta(minutes=10)):
             self.assertFalse(scope["is_fresh_intraday_row"]("A",{"timestamp":ts}))
 
-    def test_flat_eod_with_pending_buy_is_not_confirmed_flat(self):
-        broker = Mock()
-        broker.get_all_positions.return_value = []
-        broker.get_orders.return_value = [SimpleNamespace(side="buy")]
-        scope = functions("flatten_end_of_day", trading=broker)
+    def test_eod_requires_lifecycle_reconciliation_before_confirming_flat(self):
+        life = Mock()
+        life.liquidate.return_value = {"complete":False, "blockers":["pending BUY"]}
+        scope = functions("flatten_end_of_day", ORDER_LIFECYCLE=life, pd=pd,
+                          closing_request=sentinel, OrderBlocked=RuntimeError)
         self.assertFalse(scope["flatten_end_of_day"]())
-        broker.cancel_orders.assert_called_once()
-        broker.get_orders.return_value = []
+        life.liquidate.return_value = {"complete":True, "blockers":[]}
         self.assertTrue(scope["flatten_end_of_day"]())
+        self.assertEqual(life.liquidate.call_count,2)
+        self.assertIs(life.liquidate.call_args.args[1],sentinel)
 
     def test_unknown_and_pending_cancel_orders_still_reserve_exposure(self):
         broker = Mock()
@@ -99,19 +100,20 @@ class PaperBoundaryTests(unittest.TestCase):
             self.assertEqual(len(scope["_active_buy_orders"]()), 1)
             self.assertTrue(scope["has_open_buy_order"]("A"))
 
-    def test_eod_after_close_still_requires_empty_order_book(self):
-        broker = Mock()
-        broker.get_all_positions.side_effect = [[SimpleNamespace(symbol="A")], []]
-        broker.get_orders.return_value = [SimpleNamespace(side="buy")]
-        scope = functions("flatten_end_of_day", trading=broker, time=SimpleNamespace(sleep=lambda _:None))
-        self.assertFalse(scope["flatten_end_of_day"]())
-        broker.close_all_positions.assert_called_once_with(cancel_orders=True)
+    def test_eod_error_never_calls_bulk_cancel_close_and_alerts_final_minute(self):
+        broker, life, alert = Mock(), Mock(), Mock()
+        life.liquidate.side_effect = ConnectionError("offline failure")
+        scope = functions("flatten_end_of_day", trading=broker, ORDER_LIFECYCLE=life,
+                          pd=pd, closing_request=sentinel, OrderBlocked=RuntimeError,
+                          _send_eod_critical_once=alert)
+        self.assertFalse(scope["flatten_end_of_day"](30))
+        alert.assert_called_once()
+        broker.close_all_positions.assert_not_called()
+        broker.cancel_orders.assert_not_called()
 
-    def test_eod_cancel_failure_fails_closed(self):
-        broker = Mock()
-        broker.get_all_positions.return_value = []
-        broker.cancel_orders.side_effect = ConnectionError("offline failure")
-        scope = functions("flatten_end_of_day", trading=broker)
+    def test_eod_uninitialized_lifecycle_cannot_claim_flat(self):
+        scope = functions("flatten_end_of_day", ORDER_LIFECYCLE=None,
+                          OrderBlocked=RuntimeError)
         self.assertFalse(scope["flatten_end_of_day"]())
 
 

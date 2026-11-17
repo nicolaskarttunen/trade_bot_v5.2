@@ -11,14 +11,15 @@ def encode(bundle):
         return dict(mean=m.scaler_.mean_.tolist(), std=m.scaler_.std_.tolist())
     def logistic(m):
         return dict(**scaler(m), w=m.w_.tolist(), b=float(m.b_))
-    return dict(version=1,feature_contract=bundle["feature_contract"],features=bundle["features"],
+    return dict(version=2,feature_contract=bundle["feature_contract"],features=bundle["features"],
+                target=dict(bundle["metadata"]["target"]),
                 main=logistic(main),members=[dict(cols=cols.tolist(),**logistic(m)) for cols,m in ensemble.models_],
                 centroid=dict(**scaler(centroid),c0=centroid.c0_.tolist(),c1=centroid.c1_.tolist(),
                               scale=float(centroid.margin_scale_)))
 
 
 def decode(state,cfg):
-    if state.get("version")!=1 or state["feature_contract"].get("news_mode")!="neutral":
+    if state.get("version")!=2 or state["feature_contract"].get("news_mode")!="neutral":
         raise ValueError("Invalid simulation model contract")
     def vector(x,n):
         a=np.asarray(x,dtype=float)
@@ -44,6 +45,7 @@ def decode(state,cfg):
     centroid.c0_,centroid.c1_=vector(d["c0"],n),vector(d["c1"],n)
     centroid.margin_scale_=float(d["scale"])
     if not np.isfinite(centroid.margin_scale_) or centroid.margin_scale_<=0: raise ValueError("Invalid margin scale")
-    bundle=dict(models=[main,ensemble,centroid],features=state["features"],feature_contract=state["feature_contract"])
+    bundle=dict(models=[main,ensemble,centroid],features=state["features"],feature_contract=state["feature_contract"],
+                metadata={"target":state.get("target")})
     validate_bundle(bundle,cfg)
     return bundle

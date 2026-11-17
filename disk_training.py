@@ -14,7 +14,7 @@ import pandas as pd
 
 from features import FEATURES
 from ml_models import Standardizer
-from model_pipeline import make_models, feature_contract
+from model_pipeline import make_models, feature_contract, training_metadata
 
 BLOCK_ROWS = 32768
 RECORD = np.dtype([("timestamp", "<i8"), ("x", "<f8", (len(FEATURES),)), ("y", "<f8")])
@@ -213,6 +213,7 @@ def fit_centroid(path, model, block_rows=BLOCK_ROWS):
 
 def fit_disk_bundle(store, cfg, news_mode, metadata=None, block_rows=BLOCK_ROWS,
                     progress=lambda message: print(message, flush=True)):
+    metadata = training_metadata(cfg, metadata)
     if block_rows < 1 or store.path.stat().st_size != store.rows*RECORD.itemsize:
         raise ValueError("Incomplete disk training set")
     classes = set()

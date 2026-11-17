@@ -6,6 +6,22 @@ from news_features import NEWS_POLICY
 from ml_models import LogisticGD, RandomLinearEnsemble, CentroidClassifier
 
 
+def prediction_target(cfg):
+    horizon, threshold = cfg["label_horizon_bars"], float(cfg["label_threshold_pct"])
+    if isinstance(horizon, bool) or int(horizon) != horizon or horizon < 1 or not np.isfinite(threshold):
+        raise ValueError("Invalid prediction target")
+    return dict(horizon_bars=int(horizon), threshold_pct=threshold, expected_profit_model=False)
+
+
+def training_metadata(cfg, metadata=None):
+    result = dict(metadata or {})
+    target = prediction_target(cfg)
+    if "target" in result and result["target"] != target:
+        raise ValueError("Training metadata target differs from configuration")
+    result["target"] = target
+    return result
+
+
 def feature_contract(cfg, news_mode):
     if news_mode not in {"neutral", "received", "publication_proxy"}:
         raise ValueError("Unknown news mode")
@@ -28,6 +44,8 @@ def validate_bundle(bundle, cfg, live=False):
         raise ValueError("Publication-only news artifacts are research proxies, not live-compatible")
     if not bundle.get("models"):
         raise ValueError("Model bundle is empty")
+    if bundle.get("metadata", {}).get("target") != prediction_target(cfg):
+        raise ValueError("Prediction target mismatch. Retrain or supply the original verified target metadata.")
     return mode
 
 
@@ -49,6 +67,7 @@ def make_models():
 
 
 def fit_bundle(train, cfg, news_mode, metadata=None):
+    metadata = training_metadata(cfg, metadata)
     X = train[FEATURES].to_numpy(dtype=float)
     y = train["target"].to_numpy(dtype=float)
     if len(train) == 0 or not np.isfinite(X).all() or not np.isfinite(y).all() or set(np.unique(y)) != {0, 1}:
@@ -58,7 +77,7 @@ def fit_bundle(train, cfg, news_mode, metadata=None):
         model.fit(X, y.astype(int))
     return {"models": models, "features": list(FEATURES),
             "feature_contract": feature_contract(cfg, news_mode),
-            "metadata": metadata or {}}
+            "metadata": metadata}
 
 
 def predict_bundle(bundle, frame, cfg):

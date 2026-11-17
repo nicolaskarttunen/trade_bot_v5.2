@@ -25,7 +25,12 @@ class ForwardTests(unittest.TestCase):
         model=fit_bundle(x,cfg,"neutral")
         state=json.loads(json.dumps(fw.encode(model),allow_nan=False))
         new=fw.decode(state,cfg)
+        self.assertEqual(new["metadata"]["target"],model["metadata"]["target"])
         np.testing.assert_array_equal(predict_bundle(new,x,cfg),predict_bundle(model,x,cfg))
+        old=dict(state,version=1)
+        with self.assertRaisesRegex(ValueError,"contract"): fw.decode(old,cfg)
+        with self.assertRaisesRegex(ValueError,"target mismatch"):
+            fw.decode(state,dict(cfg,label_horizon_bars=6))
         state["members"][0]["std"][0]=0
         with self.assertRaisesRegex(ValueError,"scale"): fw.decode(state,cfg)
 

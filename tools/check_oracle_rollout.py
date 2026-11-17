@@ -96,10 +96,13 @@ def journal_summary(path, account_id):
     with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)) as db:
         db.execute("PRAGMA query_only=ON")
         metadata = dict(db.execute("SELECT key,value FROM metadata"))
-        if metadata.get("schema_version") != "1":
+        if metadata.get("schema_version") not in {"1", "2"}:
             raise CheckError("Existing journal schema is unsupported")
         rows = db.execute("SELECT broker_id,state FROM intents").fetchall()
+        pending_liquidations = (db.execute("SELECT COUNT(*) FROM liquidations WHERE verified_at IS NULL").fetchone()[0]
+                                if metadata["schema_version"] == "2" else 0)
     return dict(present=True, intents=len(rows), unresolved=sum(s != "observed" for _, s in rows),
+                pending_liquidations=pending_liquidations,
                 account_matches=metadata.get("account_id") == str(account_id)), {b for b, _ in rows if b}
 
 
@@ -128,6 +131,8 @@ def account_state(source, broker):
         findings.append("Existing journal belongs to a different account")
     if journal["unresolved"]:
         findings.append("Existing unresolved order intents require reconciliation")
+    if journal.get("pending_liquidations"):
+        findings.append("Existing liquidation has not been verified flat")
     if legacy:
         findings.append("Legacy submitted queue records require reconciliation")
     if journal["intents"] and (not state or state.get("date") is None):

@@ -96,6 +96,19 @@ class FeatureContractTests(unittest.TestCase):
         new = training_rows(label(enrich(changed, changed)), self.raw.timestamp.iloc[0], cutoff)
         pd.testing.assert_frame_equal(tr, new)
 
+    def test_changed_prediction_horizon_or_event_cannot_reuse_model(self):
+        for change in ({"label_horizon_bars":6}, {"label_threshold_pct":.01}):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError,"Prediction target mismatch"):
+                validate_bundle(self.bundle, dict(CFG, **change))
+        with self.assertRaisesRegex(ValueError,"Prediction target mismatch"):
+            validate_bundle(dict(self.bundle, metadata={}), CFG, live=True)
+        self.assertFalse(self.bundle["metadata"]["target"]["expected_profit_model"])
+
+    def test_declared_training_target_must_match_configuration(self):
+        from model_pipeline import training_metadata
+        with self.assertRaisesRegex(ValueError,"target differs"):
+            training_metadata(CFG, {"target":{"horizon_bars":999}})
+
     def test_label_gap_and_multiple_symbols_rejected(self):
         x = self.raw.iloc[:8].drop(index=2).reset_index(drop=True)
         self.assertTrue(pd.isna(label(x).iloc[0].target))

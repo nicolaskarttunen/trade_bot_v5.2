@@ -1,7 +1,7 @@
 """Alpaca SDK adapter; importing this module never constructs a client."""
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (GetOrderByIdRequest, GetOrdersRequest,
-    LimitOrderRequest, TakeProfitRequest, StopLossRequest)
+    LimitOrderRequest, MarketOrderRequest, TakeProfitRequest, StopLossRequest)
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, QueryOrderStatus
 from order_journal import OrderBlocked
 
@@ -40,3 +40,9 @@ def protective_request(cid, symbol, qty, stop, target):
         order_class=OrderClass.OCO, limit_price=target,
         take_profit=TakeProfitRequest(limit_price=target),
         stop_loss=StopLossRequest(stop_price=stop))
+
+
+def closing_request(cid, symbol, qty):
+    return MarketOrderRequest(client_order_id=cid, symbol=symbol, qty=qty,
+        side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
+        order_class=OrderClass.SIMPLE)
