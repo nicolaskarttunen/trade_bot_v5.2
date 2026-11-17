@@ -55,6 +55,28 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def order_nodes(root):
+    """Validate nested cumulative fills before they can authorize a SELL."""
+    result = {}
+    def visit(node):
+        oid = node.get("id")
+        if not oid or oid in result:
+            raise OrderBlocked("Missing/duplicate broker order id")
+        qty, filled = decimal_value(node.get("qty"), positive=True), decimal_value(node.get("filled_qty"))
+        status = node.get("status")
+        if status not in ACTIVE | TERMINAL or filled > qty or (status == "filled" and filled != qty):
+            raise OrderBlocked("Invalid nested broker status/fill")
+        if filled:
+            decimal_value(node.get("filled_avg_price"), positive=True)
+        result[oid] = node
+        for child in node.get("legs", []):
+            if child.get("symbol") != root.get("symbol") or child.get("side") != "sell":
+                raise OrderBlocked("Exit identity mismatch")
+            visit(child)
+    visit(root)
+    return result
+
+
 class OrderJournal:
     def __init__(self, path, account_id):
         self.path = Path(path)
@@ -63,7 +85,15 @@ class OrderJournal:
             raise OrderBlocked("Paper account id required")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as db:
-            db.executescript('''
+            # Check the binding before any DDL. Upgrade v1 atomically; old
+            # writers refuse v2 rather than ignoring durable close attempts.
+            db.execute("BEGIN IMMEDIATE")
+            exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata'").fetchone()
+            if exists:
+                old = dict(db.execute("SELECT key,value FROM metadata"))
+                if old.get("schema_version") not in {"1", "2"} or old.get("account_id") != self.account_id:
+                    raise OrderBlocked("Journal schema/account mismatch")
+            schema = '''
                 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS intents (
                     client_id TEXT PRIMARY KEY, session TEXT NOT NULL, symbol TEXT NOT NULL,
@@ -76,13 +106,17 @@ class OrderJournal:
                 CREATE TABLE IF NOT EXISTS events (
                     seq INTEGER PRIMARY KEY, client_id TEXT NOT NULL,
                     observed_at TEXT NOT NULL, event TEXT NOT NULL, payload TEXT NOT NULL);
-            ''')
-            db.execute("BEGIN IMMEDIATE")
-            for key, value in [("schema_version", "1"), ("account_id", self.account_id)]:
-                old = db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
-                if old and old[0] != value:
-                    raise OrderBlocked("Journal schema/account mismatch")
-                db.execute("INSERT OR IGNORE INTO metadata VALUES (?,?)", (key, value))
+                CREATE TABLE IF NOT EXISTS liquidations (
+                    session TEXT PRIMARY KEY, started_at TEXT NOT NULL, verified_at TEXT);
+                CREATE TABLE IF NOT EXISTS cancellations (
+                    order_id TEXT PRIMARY KEY, client_id TEXT NOT NULL,
+                    session TEXT NOT NULL, requested_at TEXT NOT NULL, error TEXT);
+            '''
+            for statement in schema.split(";"):
+                if statement.strip():
+                    db.execute(statement)
+            db.execute("INSERT OR REPLACE INTO metadata VALUES ('schema_version','2')")
+            db.execute("INSERT OR IGNORE INTO metadata VALUES ('account_id',?)", (self.account_id,))
 
     @contextmanager
     def connection(self):
@@ -122,13 +156,16 @@ class OrderJournal:
         qty = decimal_value(request.get("qty"), positive=True)
         if qty != qty.to_integral_value():
             raise OrderBlocked("This lifecycle supports integer-share orders only")
-        if role not in {"entry", "protection"} or request.get("side") != {"entry": "buy", "protection": "sell"}[role]:
+        if role not in {"entry", "protection", "close"} or request.get("side") != {"entry": "buy", "protection": "sell", "close": "sell"}[role]:
             raise OrderBlocked("Invalid order side")
         ref = str(decimal_value(reference_price, positive=True))
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             if db.execute("SELECT 1 FROM intents WHERE client_id=?", (cid,)).fetchone():
                 raise OrderBlocked("Intent already exists: reconcile; never resend")
+            if role == "entry" and db.execute(
+                    "SELECT 1 FROM liquidations WHERE session=? OR verified_at IS NULL LIMIT 1", (session,)).fetchone():
+                raise OrderBlocked("Liquidation blocks new BUYs for this session or until resolved")
             if role == "entry" and db.execute(
                     "SELECT 1 FROM intents WHERE state != 'observed' LIMIT 1").fetchone():
                 raise OrderBlocked("An unresolved intent blocks all new BUYs")
@@ -179,6 +216,20 @@ class OrderJournal:
                 raise OrderBlocked("Filled status without complete quantity")
             if old["status"] in TERMINAL and status != old["status"]:
                 raise OrderBlocked("Terminal order status regressed/changed")
+            nodes = order_nodes(snapshot)
+            previous = order_nodes(old["snapshot"]) if old["snapshot"] else {}
+            if set(previous) - set(nodes):
+                raise OrderBlocked("Previously observed exit legs disappeared")
+            for oid, prior in previous.items():
+                current = nodes[oid]
+                if (current["symbol"] != prior["symbol"] or current["side"] != prior["side"]
+                        # Alpaca may reduce the sibling stop's quantity after
+                        # a partial take-profit fill. Growing/replacing an
+                        # observed exit still needs explicit reconciliation.
+                        or decimal_value(current["qty"]) > decimal_value(prior["qty"])
+                        or decimal_value(current["filled_qty"]) < decimal_value(prior["filled_qty"])
+                        or (prior["status"] in TERMINAL and current["status"] != prior["status"])):
+                    raise OrderBlocked("Nested order identity/status/fills regressed")
             avg = str(decimal_value(snapshot.get("filled_avg_price"), positive=True)) if filled else None
             encoded = canonical(snapshot)
             if encoded != canonical(old["snapshot"]):
@@ -207,6 +258,47 @@ class OrderJournal:
             db.execute("BEGIN IMMEDIATE")
             db.execute("UPDATE intents SET settled=1 WHERE client_id=?", (cid,))
             self._event(db, cid, "closed_reconciled", {})
+
+    def begin_liquidation(self, session):
+        with self.connection() as db:
+            db.execute("INSERT OR IGNORE INTO liquidations(session,started_at) VALUES (?,?)", (session, now()))
+
+    def is_liquidating(self, session):
+        with self.connection() as db:
+            return bool(db.execute("SELECT 1 FROM liquidations WHERE session=? OR verified_at IS NULL LIMIT 1", (session,)).fetchone())
+
+    def finish_liquidation(self):
+        # The caller must first reconcile all fills, flat positions and no
+        # open orders. Keep today's marker so the next poll cannot buy again.
+        with self.connection() as db:
+            db.execute("UPDATE liquidations SET verified_at=? WHERE verified_at IS NULL", (now(),))
+
+    def claim_order_cancel(self, cid, order_id, session):
+        """Consume one cancellation attempt for an owned parent or child ID."""
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = self._decode(db.execute("SELECT * FROM intents WHERE client_id=?", (cid,)).fetchone())
+            def ids(node):
+                if not node:
+                    return set()
+                return {node.get("id")} | set().union(*(ids(x) for x in node.get("legs", [])))
+            if not row or row["state"] != "observed" or order_id not in ids(row["snapshot"]):
+                raise OrderBlocked("Cannot cancel an unidentified order")
+            if db.execute("SELECT 1 FROM cancellations WHERE order_id=?", (order_id,)).fetchone():
+                return False
+            # An opening partial's parent may already have consumed its
+            # cancel attempt through v1's per-intent flag.
+            if order_id == row["broker_id"] and row["cancel_requested"]:
+                return False
+            db.execute("INSERT INTO cancellations VALUES (?,?,?,?,NULL)", (order_id, cid, session, now()))
+            if order_id == row["broker_id"]:
+                db.execute("UPDATE intents SET cancel_requested=1 WHERE client_id=?", (cid,))
+            self._event(db, cid, "liquidation_cancel_requested", {"order_id": order_id})
+        return True
+
+    def cancel_unknown(self, order_id, reason):
+        with self.connection() as db:
+            db.execute("UPDATE cancellations SET error=? WHERE order_id=?", (reason, order_id))
 
     def daily_symbols(self, session):
         # Attempts remain consumed even after rejection: conservative daily cap.

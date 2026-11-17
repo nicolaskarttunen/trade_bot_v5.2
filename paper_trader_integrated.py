@@ -26,7 +26,7 @@ from news_features import news_scores
 from alpaca.common.enums import Sort
 from order_journal import OrderJournal, OrderBlocked, ProcessLock
 from order_lifecycle import OrderLifecycle
-from paper_order_adapter import PaperTradingClient, lookup_nested, open_orders, protective_request
+from paper_order_adapter import PaperTradingClient, lookup_nested, open_orders, protective_request, closing_request
 from entry_selection import rank_entry_candidates, long_trade_plan, valid_opening_selection, SELECTION_POLICY
 
 ORDER_LIFECYCLE = None
@@ -1224,108 +1224,24 @@ def _send_eod_critical_once(message):
 
 
 def flatten_end_of_day(seconds_to_close=None):
-    """
-    Legacy bulk end-of-day flatten (ambiguous acknowledgements still unhandled).
-
-    Uses a strict Alpaca position lookup so API failures never look like an
-    empty portfolio. The market loop calls this repeatedly during the last
-    10 minutes of the broker-reported session, including early-close days.
-    """
+    """Advance the durable EOD lifecycle; acknowledgements never mean flat."""
     try:
-        positions = list(trading.get_all_positions())
+        if ORDER_LIFECYCLE is None:
+            raise OrderBlocked("Order lifecycle was not initialized")
+        session = pd.Timestamp.now(tz="America/New_York").date().isoformat()
+        result = ORDER_LIFECYCLE.liquidate(session, closing_request)
+        if result["complete"]:
+            print("EOD VERIFIED | no positions or open orders; fills reconciled")
+            return True
+        print("EOD WAIT | " + "; ".join(result["blockers"]))
     except Exception as exc:
-        print("EOD POSITION CHECK ERROR:", repr(exc))
-
-        if seconds_to_close is not None and seconds_to_close <= 60:
-            _send_eod_critical_once(
-                "🚨 EOD CRITICAL\n\n"
-                "Position check failed inside the final minute. "
-                "Verify Alpaca positions manually."
-            )
-
-        return False
-
-    if not positions:
-        try:
-            trading.cancel_orders()
-            remaining_orders = trading.get_orders()
-            remaining_positions = trading.get_all_positions()
-        except Exception as exc:
-            print("EOD FLAT VERIFY ERROR:", repr(exc))
-            return False
-        if remaining_orders or remaining_positions:
-            print("EOD RETRY | pending orders or newly filled positions remain")
-            return False
-        print("EOD VERIFIED | no positions or open orders")
-        return True
-
-    symbols = [str(position.symbol) for position in positions]
-
-    print(
-        f"EOD FLATTEN | remaining={len(symbols)} | "
-        f"symbols={','.join(symbols)} | "
-        f"seconds_to_close={seconds_to_close}"
-    )
-
-    try:
-        # Cancel bracket/OCO exits and submit market closes for every
-        # remaining position. TODO: journal close intents before this RPC.
-        # A timeout followed by a retry is NOT proven safe; deployment blocker.
-        trading.close_all_positions(cancel_orders=True)
-    except Exception as exc:
-        print("EOD CLOSE ERROR:", repr(exc))
-
-        if seconds_to_close is not None and seconds_to_close <= 60:
-            _send_eod_critical_once(
-                "🚨 EOD CRITICAL\n\n"
-                f"Close request failed with {len(symbols)} position(s) "
-                "remaining. Verify Alpaca manually."
-            )
-
-        return False
-
-    # Give market orders a short moment to fill, then verify from Alpaca.
-    time.sleep(3)
-
-    try:
-        remaining = list(trading.get_all_positions())
-    except Exception as exc:
-        print("EOD VERIFY ERROR:", repr(exc))
-
-        if seconds_to_close is not None and seconds_to_close <= 60:
-            _send_eod_critical_once(
-                "🚨 EOD CRITICAL\n\n"
-                "Could not verify that end-of-day closes filled. "
-                "Check Alpaca manually."
-            )
-
-        return False
-
-    if not remaining:
-        try:
-            if trading.get_orders():
-                print("EOD RETRY | open orders remain after position close")
-                return False
-        except Exception as exc:
-            print("EOD ORDER VERIFY ERROR:", repr(exc))
-            return False
-        print("EOD VERIFIED | all paper positions and orders closed")
-        return True
-
-    remaining_symbols = [str(position.symbol) for position in remaining]
-
-    print(
-        f"EOD RETRY NEEDED | remaining={len(remaining_symbols)} | "
-        f"symbols={','.join(remaining_symbols)}"
-    )
-
+        print("EOD RECONCILIATION ERROR |", type(exc).__name__)
     if seconds_to_close is not None and seconds_to_close <= 60:
         _send_eod_critical_once(
             "🚨 EOD CRITICAL\n\n"
-            f"{len(remaining_symbols)} position(s) still open inside the "
-            f"final minute: {', '.join(remaining_symbols)}"
+            "Flat positions and terminal orders could not be verified. "
+            "Check Alpaca manually; do not duplicate a close request."
         )
-
     return False
 
 # ------------------------------------------------------------
@@ -1995,6 +1911,11 @@ def market_loop():
     print("PAPER ONLY | REALTIME NEWS | ML | 5-MIN BARS | ORDERS ENABLED")
     print("=" * 65)
     print("Symbols:", ", ".join(SYMBOLS))
+    print(f"MODEL TARGET | horizon_bars={CFG['label_horizon_bars']} | "
+          f"return_threshold={CFG['label_threshold_pct']} | trade_profit_probability=false")
+    print(f"RISK LIMITS | max_position={CFG['max_position_pct']:.1%} | "
+          f"max_total_exposure={CFG['max_total_exposure_pct']:.1%} | "
+          f"daily_entry_loss_gate={CFG['max_daily_loss_pct']:.1%}")
     print()
 
     while True:

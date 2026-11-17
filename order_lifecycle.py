@@ -138,6 +138,13 @@ class OrderLifecycle:
         for entry in self.journal.rows():
             if entry["settled"] or entry["role"] != "entry" or entry["state"] != "observed":
                 continue
+            if entry["metadata"].get("mode") != "opening":
+                # Intraday brackets already own their exits. Canceling their
+                # partial parent also cancels those exits and strands the fill.
+                # Only standalone opening BUYs use this cancel-and-protect flow.
+                continue
+            if self.journal.is_liquidating(entry["session"]):
+                continue
             filled = decimal_value(entry["filled_qty"])
             if not filled:
                 continue
@@ -147,10 +154,6 @@ class OrderLifecycle:
             if entry["status"] not in TERMINAL:
                 self._request_partial_cancel(entry)
                 blockers.append(f"{entry['symbol']}: partial BUY; waiting for terminal cancellation/fill")
-                continue
-            if entry["metadata"].get("mode") != "opening":
-                # A canceled partial bracket can have hidden/inactive children.
-                # Do not attach a competing OCO without broker-specific proof.
                 continue
             protection_id = client_id(self.journal.account_id, entry["session"], entry["symbol"], "protection")
             protection = self.journal.get(protection_id)
@@ -188,6 +191,8 @@ class OrderLifecycle:
         rows = self.journal.rows()
         positions = self._positions()
         blockers = []
+        if self.journal.is_liquidating(session):
+            blockers.append("Liquidation blocks new entries")
         owned_symbols = {r["symbol"] for r in rows if r["role"] == "entry" and not r["settled"] and decimal_value(r["filled_qty"]) > 0}
         if set(positions)-owned_symbols:
             blockers.append("Unowned positions require manual reconciliation")
@@ -224,6 +229,101 @@ class OrderLifecycle:
                 if not ok:
                     blockers.append(f"{row['symbol']}: {reason}")
         return blockers
+
+    def liquidate(self, session, request_factory):
+        """Cancel known entry/exits, observe terminal states, then close once.
+
+        No bulk cancel/close calls. A close in flight (including a partial
+        fill) is never canceled or submitted again. Uncertain orders, manual
+        trades and lagging positions stop progress and require reconciliation.
+        request_factory(cid, symbol, qty) constructs a simple market SELL.
+        """
+        self.journal.begin_liquidation(session)
+        self.reconcile()
+        rows = self.journal.rows()
+        positions = self._positions()
+        visible = [node for order in self.open_orders() for node in family(snapshot(order))]
+        blockers = [f"Unresolved {r['role']}: {r['client_id']}" for r in rows if r["state"] != "observed"]
+        known = {}
+        owners = {}
+        for row in rows:
+            if row["snapshot"]:
+                for node in family(row["snapshot"]):
+                    if node["id"] in known and node != known[node["id"]]:
+                        blockers.append("Conflicting broker order snapshots")
+                    known[node["id"]], owners[node["id"]] = node, row
+        if any(node["id"] not in known for node in visible):
+            blockers.append("Unowned open orders require manual reconciliation")
+        symbols = {r["symbol"] for r in rows if r["role"] == "entry"}
+        if set(positions) - symbols:
+            blockers.append("Unowned positions require manual reconciliation")
+        # A list/direct-lookup race cannot authorize a close. Poll again.
+        if any(node["id"] in known and known[node["id"]]["status"] in TERMINAL
+               and node["status"] not in TERMINAL for node in visible):
+            blockers.append("Open-order list disagrees with terminal lookup")
+        if blockers:
+            return dict(complete=False, blockers=blockers)
+
+        active = [node for node in known.values()
+                  if node["status"] not in TERMINAL and owners[node["id"]]["role"] != "close"]
+        for node in active:
+            owner = owners[node["id"]]
+            # Cancel the family root first. A bracket/OCO cancel may cancel
+            # its children too; observe that result on a later poll.
+            root = owner["snapshot"]
+            if node["id"] != root["id"] and root["status"] not in TERMINAL:
+                continue
+            if self.journal.claim_order_cancel(owner["client_id"], node["id"], session):
+                try:
+                    self.broker.cancel_order_by_id(node["id"])
+                except Exception as exc:
+                    self.journal.cancel_unknown(node["id"], "Cancel acknowledgement unknown: " + type(exc).__name__)
+        if active:
+            return dict(complete=False, blockers=["Waiting for terminal entry/exit cancellations; no close submitted"])
+
+        # All entry/exit orders are now terminal, so late entry and protective
+        # fills are included before choosing the remaining closing quantity.
+        balances = {symbol: Decimal(0) for symbol in symbols}
+        for node in known.values():
+            if node["side"] not in {"buy", "sell"} or node["symbol"] not in balances:
+                raise OrderBlocked("Unexpected owned order contract")
+            filled, qty = decimal_value(node["filled_qty"]), decimal_value(node["qty"], positive=True)
+            if filled > qty:
+                raise OrderBlocked("Exit fill quantity exceeds order size")
+            balances[node["symbol"]] += filled * (1 if node["side"] == "buy" else -1)
+        for symbol, expected in balances.items():
+            actual = decimal_value(field(positions.get(symbol), "qty", 0))
+            if expected < 0 or actual != expected or actual != actual.to_integral_value():
+                blockers.append(f"{symbol}: position and cumulative fills disagree or require fractional handling")
+        if blockers:
+            return dict(complete=False, blockers=blockers)
+
+        for symbol in sorted(positions):
+            actual = decimal_value(field(positions[symbol], "qty"))
+            if not actual:
+                continue
+            prior = [r for r in rows if r["symbol"] == symbol and r["role"] == "close" and not r["settled"]]
+            if prior:
+                blockers.append(f"{symbol}: existing close must fill/reconcile; never cancel or resend")
+                continue
+            entries = [r for r in rows if r["symbol"] == symbol and r["role"] == "entry"]
+            reference = entries[-1]["reference_price"]
+            try:
+                self.submit_once(session, symbol, "close",
+                    lambda cid, s=symbol, q=int(actual): request_factory(cid, s, q), reference,
+                    {"reason": "end_of_day", "entry_client_ids": [r["client_id"] for r in entries]})
+                blockers.append(f"{symbol}: close submitted; waiting for observed fill and flat position")
+            except OrderBlocked as exc:
+                blockers.append(str(exc))
+        if blockers:
+            return dict(complete=False, blockers=blockers)
+        if visible or positions or any(node["status"] not in TERMINAL for node in known.values()):
+            return dict(complete=False, blockers=["Waiting for flat positions and no active orders"])
+        for row in rows:
+            if not row["settled"]:
+                self.journal.settle(row["client_id"])
+        self.journal.finish_liquidation()
+        return dict(complete=True, blockers=[])
 
     def reserve_exposure(self, session, exposure_by_symbol):
         """Conservative per-symbol maximum avoids position/pending double count.
